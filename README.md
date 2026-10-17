@@ -7,7 +7,7 @@ Base indépendante du script **TwitchAdSolutions (vaft)**, maintenue dans le dé
 - Basée sur la version **37.0.0** de [pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions), dont le dépôt est archivé depuis le 5 mars 2026.
 - Le fonctionnement du bloqueur et ses réglages d’origine sont conservés. **Aucune amélioration fonctionnelle n’est incluse à ce stade.**
 - Seules les métadonnées du userscript ont été adaptées : identifiant du projet (`@namespace`), adresses de mise à jour, page du projet, lien de signalement et version de distribution.
-- La version **37.0.2** affiche le nom **Twitch VAFT — MATTEO12SA** dans Violentmonkey pour distinguer ce projet du script d’origine ; le fonctionnement reste inchangé.
+- La version **37.0.2** affiche le nom **TwitchAD VAFT MATTEO12SA** dans Violentmonkey pour distinguer ce projet du script d’origine ; le fonctionnement reste inchangé.
 
 ## Installation avec Violentmonkey
 

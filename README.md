@@ -1,24 +1,31 @@
 # Twitch VAFT pour Violentmonkey
 
-Ce dépôt héberge une copie **sans modification** du script `TwitchAdSolutions (vaft)` **37.0.0**, issu de [pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions). Le fichier `vaft.user.js` est conservé tel qu’il a été fourni.
+Base indépendante du script **TwitchAdSolutions (vaft)**, maintenue dans le dépôt **MATTEO12SA/twitch-vaft-violentmonkey** pour préparer de futures améliorations.
+
+## État de cette base
+
+- Basée sur la version **37.0.0** de [pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions), dont le dépôt est archivé depuis le 5 mars 2026.
+- Le fonctionnement du bloqueur et ses réglages d’origine sont conservés. **Aucune amélioration fonctionnelle n’est incluse à ce stade.**
+- Seules les métadonnées du userscript ont été adaptées : identifiant du projet (`@namespace`), adresses de mise à jour, page du projet, lien de signalement et version de distribution.
+- La version **37.0.1** identifie cette première base autonome ; elle ne correspond pas à une amélioration du blocage.
 
 ## Installation avec Violentmonkey
 
-1. Installer [Violentmonkey](https://violentmonkey.github.io/get-it/) dans votre navigateur.
-2. Ouvrir **[Installer le script VAFT](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js)**.
-3. Vérifier que la fenêtre d’installation est celle de Violentmonkey, puis confirmer l’installation du script.
-4. Ouvrir Twitch ou recharger les onglets Twitch déjà ouverts.
+1. Installer [Violentmonkey](https://violentmonkey.github.io/get-it/).
+2. Si une ancienne installation de VAFT est présente, la désactiver ou la supprimer dans Violentmonkey pour éviter d’exécuter deux versions.
+3. Ouvrir **[Installer VAFT depuis ce dépôt](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js)**, puis confirmer dans Violentmonkey.
+4. Recharger les onglets Twitch.
 
-Les instructions de ce dépôt concernent **uniquement Violentmonkey**. Cette restriction concerne la documentation : le script original n’a pas été modifié pour empêcher son utilisation avec un autre gestionnaire de scripts.
+Le `@namespace` étant désormais propre à ce dépôt, une ancienne installation doit être remplacée une fois via ce lien. Les instructions sont destinées à **Violentmonkey** ; aucun verrou contre les autres gestionnaires n’a été ajouté.
 
-## Mises à jour
+## Mises à jour de ce projet
 
-Les métadonnées `@updateURL` et `@downloadURL` restent inchangées et pointent vers le dépôt **pixeltris/TwitchAdSolutions**, archivé le **5 mars 2026**. Violentmonkey utilise donc ces adresses d’origine pour rechercher et télécharger les mises à jour, et non celles de ce dépôt.
+`@updateURL` et `@downloadURL` pointent tous deux vers [notre fichier `vaft.user.js`](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js), sur la branche `main`. Les futures versions seront donc récupérées depuis **ce dépôt**, selon les réglages de mise à jour de Violentmonkey.
 
-La présence de cette copie ne garantit ni sa maintenance ni son efficacité actuelle contre les publicités Twitch.
+Pour publier une future évolution, modifier `vaft.user.js` et augmenter `@version`. Les références au projet d’origine servent à conserver la provenance et les crédits.
 
-## Origine et licence
+## Crédits et licence
 
-Le script et ses crédits proviennent du [projet d’origine](https://github.com/pixeltris/TwitchAdSolutions) ; son en-tête renvoie également aux [crédits de VideoAdBlockForTwitch](https://github.com/cleanlock/VideoAdBlockForTwitch#credits).
+Code d’origine : [TwitchAdSolutions et ses contributeurs](https://github.com/pixeltris/TwitchAdSolutions), avec les [crédits de VideoAdBlockForTwitch](https://github.com/cleanlock/VideoAdBlockForTwitch#credits) conservés dans le script.
 
-Le script est distribué sous [licence MIT](LICENSE). Ce dépôt est une copie indépendante, sans affiliation avec les auteurs d’origine, Twitch ou Violentmonkey.
+La [licence MIT d’origine](LICENSE) est conservée. Ce projet est indépendant de Twitch et de Violentmonkey.

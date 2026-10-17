@@ -1,4 +1,4 @@
-# Twitch VAFT — MATTEO12SA
+# TwitchAD VAFT MATTEO12SA
 
 Base indépendante du script **TwitchAdSolutions (vaft)**, maintenue dans le dépôt **MATTEO12SA/twitch-vaft-violentmonkey** pour préparer de futures améliorations.
 

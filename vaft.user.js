@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         TwitchAdSolutions (vaft)
-// @namespace    https://github.com/pixeltris/TwitchAdSolutions
-// @version      37.0.0
+// @namespace    https://github.com/MATTEO12SA/twitch-vaft-violentmonkey
+// @version      37.0.1
 // @description  Multiple solutions for blocking Twitch ads (vaft)
-// @updateURL    https://github.com/pixeltris/TwitchAdSolutions/raw/master/vaft/vaft.user.js
-// @downloadURL  https://github.com/pixeltris/TwitchAdSolutions/raw/master/vaft/vaft.user.js
+// @updateURL    https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js
+// @downloadURL  https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js
+// @homepageURL  https://github.com/MATTEO12SA/twitch-vaft-violentmonkey
+// @supportURL   https://github.com/MATTEO12SA/twitch-vaft-violentmonkey/issues
 // @author       https://github.com/cleanlock/VideoAdBlockForTwitch#credits
 // @match        *://*.twitch.tv/*
 // @run-at       document-start

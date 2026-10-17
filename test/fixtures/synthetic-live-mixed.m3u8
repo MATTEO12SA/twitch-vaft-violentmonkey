@@ -1,0 +1,16 @@
+#EXTM3U
+# Synthetic test fixture. Not captured from Twitch; no real credentials or signatures.
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:200
+#EXT-X-DATERANGE:ID="stitched-ad-example",CLASS="twitch-stitched-ad",START-DATE="2026-01-01T00:00:02Z",DURATION=4,X-TV-TWITCH-AD-URL="https://ads.example.invalid/click",X-TV-TWITCH-AD-CLICK-TRACKING-URL="https://ads.example.invalid/tracking"
+#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z
+#EXTINF:2,live
+live-0.ts
+#EXT-X-KEY:METHOD=AES-128,URI="example.key"
+#EXTINF:2,
+ad-1.ts
+#EXTINF:2,
+ad-2.ts
+#EXTINF:2,live
+live-3.ts

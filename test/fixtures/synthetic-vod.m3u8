@@ -1,0 +1,16 @@
+#EXTM3U
+# Synthetic test fixture. Supported mapping: complete ENDLIST, sequence zero, continuous PDT.
+#EXT-X-VERSION:3
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-TARGETDURATION:4
+#EXT-X-DATERANGE:ID="stitched-ad-vod",CLASS="twitch-stitched-ad",START-DATE="2026-01-01T00:00:04Z",END-DATE="2026-01-01T00:00:12Z"
+#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z
+#EXTINF:4,
+intro.ts
+#EXTINF:4,
+ad-1.ts
+#EXTINF:4,
+ad-2.ts
+#EXTINF:4,
+content.ts
+#EXT-X-ENDLIST

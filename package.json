@@ -1,0 +1,14 @@
+{
+  "name": "twitch-vaft-violentmonkey",
+  "version": "37.0.3",
+  "private": true,
+  "description": "Independent VAFT userscript with bounded recovery and VOD isolation",
+  "license": "MIT",
+  "scripts": {
+    "build": "node tools/build.js",
+    "build:check": "node tools/build.js --check",
+    "test": "node --test test/*.test.js",
+    "check": "node --check vaft.user.js && npm run build:check && npm test"
+  },
+  "engines": { "node": ">=22" }
+}

@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Twitch VAFT — MATTEO12SA
+// @name         TwitchAD VAFT MATTEO12SA
 // @namespace    https://github.com/MATTEO12SA/twitch-vaft-violentmonkey
 // @version      37.0.2
 // @description  Multiple solutions for blocking Twitch ads (vaft)

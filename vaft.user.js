@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TwitchAD VAFT MATTEO12SA
 // @namespace    https://github.com/MATTEO12SA/twitch-vaft-violentmonkey
-// @version      37.0.3
+// @version      37.0.4
 // @description  Multiple solutions for blocking Twitch ads (vaft)
 // @updateURL    https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js
 // @downloadURL  https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js
@@ -22,7 +22,7 @@
     if (window.top !== window.self || window.__VAFT_MATTEO_ACTIVE__) return;
     Object.defineProperty(window, '__VAFT_MATTEO_ACTIVE__', { value: true, configurable: true });
     const config = {
-    "version": "37.0.3",
+    "version": "37.0.4",
     "debug": false,
     "vodAdSkipping": false,
     "forcePlayerType": "popout",
@@ -51,6 +51,7 @@
     },
     "antiAdblockSignatures": []
 };
+    Object.defineProperty(window, '__VAFT_MATTEO_VERSION__', { value: config.version, configurable: true });
 // Keep this factory self-contained: the same implementation runs in the page and Worker.
 function createNetworkTools(env = globalThis) {
     const GQL_URL = 'https://gql.twitch.tv/gql';
@@ -578,7 +579,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     // No unverified signatures: never hide Twitch's native error/anti-adblock UI.
     const verifiedOverlayRules = Object.freeze([]);
     const reservedRoutes = new Set(['directory', 'downloads', 'inventory', 'jobs', 'login', 'logout', 'search', 'settings', 'signup', 'subscriptions', 'turbo', 'videos', 'wallet', 'collections', 'p', 'friends', 'messages', 'moderator', 'dashboard']);
-    const videoEvents = ['play', 'pause', 'ended', 'loadedmetadata', 'emptied', 'timeupdate', 'seeking', 'seeked'];
+    const videoEvents = ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'emptied', 'timeupdate', 'seeking', 'seeked'];
     const metrics = { scans: 0, reactScans: 0, ticks: 0, tasks: 0, vodSkips: 0, contexts: 0, diagnostics: 0 };
     const diagnosticTimes = new Map();
     let running = false;
@@ -595,10 +596,12 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     let context = { kind: 'unknown', id: null, epoch: 0 };
     let status = { state: 'playing', hasAds: false, isMidroll: false };
     let reactCache;
+    let reactCacheRetryAt = 0;
     let lastTaskAt = -Infinity;
     let internalAction = false;
     let expectedPause = null;
     let intentionalPause = false;
+    let mediaWasLoaded = false;
     let restore = null;
     let progress = { position: null, at: 0, started: false };
     let vod = { ranges: [], reliable: false, attempts: new Set(), position: null, pausedByUs: false, expectedSeek: null };
@@ -665,15 +668,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
             banner.style.cssText = 'position:absolute;top:0;left:0;z-index:2;padding:5px 8px;color:white;background:rgba(0,0,0,.8);font:12px sans-serif;pointer-events:none;';
             container.appendChild(banner);
         }
-        const labels = {
-            searching: 'VAFT : recherche d’un flux sans publicité…',
-            'waiting-ad': 'VAFT : publicité bloquée, en attente d’un flux utilisable…',
-            waiting: 'VAFT : publicité bloquée, en attente d’un flux utilisable…',
-            awaiting: 'VAFT : publicité bloquée, en attente d’un flux utilisable…',
-            resuming: 'VAFT : reprise de la lecture…',
-            error: 'VAFT : récupération du lecteur indisponible.'
-        };
-        const label = labels[status.state] || 'VAFT : blocage des publicités';
+        const label = status.state === 'error' ? 'Récupération du lecteur indisponible.' : 'Pub bloquée';
         if (banner.textContent !== label) banner.textContent = label;
         banner.style.display = 'block';
     }
@@ -692,11 +687,16 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         restore = null;
     }
 
-    function bindVideo(nextVideo) {
+    function bindVideo(nextVideo, preservePause = false) {
         if (video === nextVideo) return false;
+        const retainedPause = preservePause && intentionalPause;
         if (video) videoEvents.forEach(event => video.removeEventListener(event, onVideoEvent));
         video = nextVideo;
-        intentionalPause = restore ? restore.paused : !!video?.paused;
+        mediaWasLoaded = !!video && (video.readyState > 0 || video.currentTime > 0);
+        const initialBuffering = !!video && video.readyState === 0 && video.currentTime === 0;
+        // A fresh HAVE_NOTHING video is paused by default. All subsequent pause
+        // events remain protected, including a pause before metadata arrives.
+        intentionalPause = retainedPause || (restore ? restore.paused : !!video?.paused && !initialBuffering);
         expectedPause = null;
         reactCache = undefined;
         progress = { position: null, at: now(), started: false };
@@ -727,9 +727,11 @@ function createPlayerController(env, options = {}, callbacks = {}) {
             if (videos.length === 1) { nextContainer = players[0]; nextVideo = videos[0]; }
         }
         if (container !== nextContainer) { removeBanner(); container = nextContainer; }
-        const mediaChanged = bindVideo(nextVideo);
         const nextRoute = pathname();
         if (nextRoute !== route) restore = null;
+        // Replacing the DOM video on one route is not a new request to play,
+        // even if the old element disappears before its replacement arrives.
+        const mediaChanged = bindVideo(nextVideo, nextRoute === route);
         route = nextRoute;
         dirty = false;
         changeContext(ambiguous ? { kind: 'unknown', id: null } : classify(route), mediaChanged);
@@ -778,6 +780,9 @@ function createPlayerController(env, options = {}, callbacks = {}) {
 
     function onVideoEvent(event) {
         if (!running || suspended || event.target !== video) return;
+        if (video.readyState > 0 || video.currentTime > 0 || event.type === 'loadedmetadata' || event.type === 'playing') {
+            mediaWasLoaded = true;
+        }
         const ownPause = event.type === 'pause' && expectedPause === video;
         if (ownPause) expectedPause = null;
         if (!internalAction && !ownPause && event.type === 'pause') {
@@ -786,6 +791,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
             if (restore) restore.paused = true;
         } else if (!internalAction && event.type === 'play') {
             intentionalPause = false;
+            if (restore) restore.paused = false;
         }
         if (event.type === 'seeking' && !internalAction && video.paused &&
             !(vod.expectedSeek !== null && Math.abs(video.currentTime - vod.expectedSeek) < 0.25)) {
@@ -812,8 +818,13 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     function getPlayerAndState() {
         refresh();
         if (!video || !container) return null;
-        if (reactCache !== undefined) return { ...reactCache, video, container };
+        // React may hydrate after the video appears. Retry incomplete associations
+        // only when needed, at the recovery cadence, instead of on every tick.
+        if (reactCache !== undefined && ((reactCache.player && reactCache.state) || now() < reactCacheRetryAt)) {
+            return { ...reactCache, video, container };
+        }
         metrics.reactScans++;
+        reactCacheRetryAt = now() + config.minReloadMs;
         const stack = [reactRoot()].filter(Boolean);
         const seen = new Set();
         const players = new Set();
@@ -844,12 +855,17 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         return { ...reactCache, video, container };
     }
 
-    function task({ reload = false, pausePlay = false } = {}) {
+    function task({ reload = false, pausePlay = false, adRecovery = false } = {}) {
         refresh();
-        if (!running || suspended || !video || context.kind !== 'live' || video.paused || video.ended || intentionalPause) return false;
+        if (!running || suspended || !video || context.kind !== 'live' || video.ended || intentionalPause) return false;
+        if (video.readyState > 0 || video.currentTime > 0) mediaWasLoaded = true;
+        const startupRecovery = reload && adRecovery === true && !mediaWasLoaded && video.readyState === 0 && video.currentTime === 0;
+        if (video.paused && !startupRecovery) return false;
         if ((!reload && !pausePlay) || now() - lastTaskAt < config.minReloadMs) return false;
         const current = getPlayerAndState();
-        const settings = { muted: video.muted, volume: video.volume, paused: video.paused };
+        // Reload may let the player start naturally; never restore its default
+        // startup pause as user intent and never issue play() for this recovery.
+        const settings = { muted: video.muted, volume: video.volume, paused: video.paused && !startupRecovery };
         const target = current?.player && typeof current.player.pause === 'function' && typeof current.player.play === 'function' ? current.player : video;
         if (reload && !current?.state) { diagnose('reload-unavailable'); return false; }
         try {
@@ -1070,6 +1086,9 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
     const blockedSegments = new Map();
     const controllers = new Set();
     const processedResponses = new WeakSet();
+    const qualityProbeIntervalMs = 8000;
+    const variantProbeTimeoutMs = 2000;
+    const candidateLimit = 4;
     const now = () => env.Date ? env.Date.now() : Date.now();
     const error = name => new env.DOMException(name, name);
     const send = (type, data = {}) => env.postMessage({ namespace: protocol, workerId, epoch: context.epoch, type, ...data });
@@ -1125,12 +1144,16 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             if (next.kind === stream.kind && String(next.id).toLowerCase() === String(id).toLowerCase()) {
                 stream.epoch = next.epoch;
                 stream.job = null;
+                stream.qualityJob = null;
             } else streams.delete(id);
         }
         for (const [url, entry] of media) if (!streams.has(entry.stream.id)) media.delete(url);
         blockedSegments.clear();
         context = { ...next };
         simulateAds = false;
+        // An empty waiting manifest can stop native polling. Re-arm the retained
+        // channel's recovery under the new epoch when its video/decoder changes.
+        for (const stream of streams.values()) if (stream.hadAds) scheduleRecovery(stream, stream.recoveryTarget);
     }
 
     function onMessage(event) {
@@ -1156,7 +1179,8 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         if (!stream) {
             stream = { id, kind: kind.kind === 'live-master' ? 'live' : 'vod', url: url.href,
                 epoch, state: 'playing', attempt: 0, nextRetry: 0, job: null, backup: null,
-                hadAds: false, codecFallback: false, variants, retryTimer: null, generation: 0, at: now() };
+                qualityJob: null, qualityController: null,
+                hadAds: false, codecFallback: false, variants, retryTimer: null, recoveryTarget: null, generation: 0, at: now() };
             streams.set(id, stream);
         }
         stream.url = url.href;
@@ -1222,15 +1246,94 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         return ['#EXTM3U', version, target, sequence, ''].join('\n');
     }
 
-    async function auxiliary(url, signal) {
-        const result = await net.requestText(realFetch, url, { signal }, config.requestTimeoutMs);
+    async function auxiliary(url, signal, timeoutMs = config.requestTimeoutMs) {
+        const result = await net.requestText(realFetch, url, { signal }, timeoutMs);
         if (!result.response.ok || !result.text.trimStart().startsWith('#EXTM3U')) throw error('DataError');
         return result.text;
     }
 
+    function variantArea(variant) {
+        const size = String(variant?.Resolution || '').match(/^(\d+)x(\d+)$/i);
+        const area = size ? Number(size[1]) * Number(size[2]) : 0;
+        return Number.isFinite(area) ? area : 0;
+    }
+
+    function compatibleVariants(variants, target) {
+        const family = codecFamily(target?.Codecs);
+        if (!family) return [];
+        const urls = new Set();
+        return variants.filter(variant => {
+            if (!variant.Url || urls.has(variant.Url) || !variantArea(variant) || codecFamily(variant.Codecs) !== family) return false;
+            urls.add(variant.Url);
+            return true;
+        });
+    }
+
+    function fitsTarget(variant, target) {
+        const area = variantArea(variant);
+        const limit = variantArea(target);
+        const family = codecFamily(target?.Codecs);
+        return !!family && codecFamily(variant?.Codecs) === family && area > 0 && (!limit || area <= limit);
+    }
+
+    function chooseCandidates(variants, target, round = 0) {
+        const pool = variants.filter(variant => fitsTarget(variant, target));
+        const preferred = hls.selectVariant(pool, target || {});
+        if (!preferred) return [];
+        const chosen = [preferred];
+        const remaining = pool.filter(variant => variant.Url !== preferred.Url)
+            .sort((a, b) => variantArea(b) - variantArea(a));
+        // Always consider a small usable picture, even when the highest quality stalls.
+        if (remaining.length) chosen.push(remaining.pop());
+        const offset = remaining.length ? (round * (candidateLimit - 2)) % remaining.length : 0;
+        const count = Math.min(candidateLimit - chosen.length, remaining.length);
+        for (let index = 0; index < count; index++) {
+            chosen.push(remaining[(offset + index) % remaining.length]);
+        }
+        return chosen;
+    }
+
+    async function probeVariants(candidates, signal) {
+        if (!candidates.length) return null;
+        const controller = new env.AbortController();
+        const onAbort = () => controller.abort();
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) controller.abort();
+        let index = 0;
+        const probe = async () => {
+            while (!controller.signal.aborted && index < candidates.length) {
+                const variant = candidates[index++];
+                try {
+                    // Release a stalled slot soon enough to try intermediate qualities
+                    // within the outer search's unchanged total deadline.
+                    const text = await auxiliary(variant.Url, controller.signal, Math.min(variantProbeTimeoutMs, config.requestTimeoutMs));
+                    const inspection = hls.inspectMedia(text, variant.Url);
+                    if (!inspection.hasAds && !simulateAds && inspection.segments.length) {
+                        return { url: variant.Url, variant, text: absolutize(inspection.sanitizedText, variant.Url), at: now() };
+                    }
+                } catch (failure) {
+                    if (controller.signal.aborted) throw failure;
+                }
+            }
+            throw error('DataError');
+        };
+        try {
+            // Only two requests run at once; the first clean result releases the player.
+            return await Promise.any(Array.from({ length: Math.min(2, candidates.length) }, probe));
+        } catch (failure) {
+            if (signal.aborted) throw error('AbortError');
+            return null;
+        } finally {
+            signal.removeEventListener('abort', onAbort);
+            controller.abort();
+        }
+    }
+
     async function search(stream, target, signal) {
         // One total deadline also bounds the sequence of fallback requests.
-        for (const playerType of config.backupPlayerTypes) {
+        // Rotate the first profile so one stalled token/master cannot starve the rest.
+        for (let index = 0; index < config.backupPlayerTypes.length; index++) {
+            const playerType = config.backupPlayerTypes[(stream.attempt + index) % config.backupPlayerTypes.length];
             if (signal.aborted || stream.epoch !== context.epoch) throw error('AbortError');
             try {
                 const access = await token(stream.id, playerType, signal);
@@ -1241,14 +1344,9 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                 const master = await auxiliary(url.href, signal);
                 const variants = hls.parseMaster(master, url.href);
                 // Do not splice incompatible codecs into a running decoder.
-                const family = codecFamily(target?.Codecs);
-                const compatible = family ? variants.filter(item => codecFamily(item.Codecs) === family) : variants;
-                const variant = hls.selectVariant(compatible, target || {});
-                if (!variant) continue;
-                const text = await auxiliary(variant.Url, signal);
-                const inspection = hls.inspectMedia(text, variant.Url);
-                if (inspection.hasAds || simulateAds || !inspection.segments.length) continue;
-                return { url: variant.Url, variant, text: absolutize(inspection.sanitizedText, variant.Url), at: now() };
+                const compatible = compatibleVariants(variants, target);
+                const result = await probeVariants(chooseCandidates(compatible, target, stream.attempt), signal);
+                if (result) return { ...result, alternatives: compatible, qualityRound: 0, nextQualityProbe: now() + qualityProbeIntervalMs };
             } catch (failure) {
                 if (signal.aborted) throw failure;
             }
@@ -1259,6 +1357,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
     function beginSearch(stream, target) {
         if (stream.job) return stream.job;
         if (now() < stream.nextRetry) return Promise.resolve(null);
+        stream.qualityController?.abort();
         status(stream, 'searching', true);
         const controller = new env.AbortController();
         controllers.add(controller);
@@ -1290,6 +1389,32 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         return job;
     }
 
+    function improveQuality(stream, cached, target) {
+        if (stream.qualityJob || now() < cached.nextQualityProbe || !stream.hadAds) return;
+        const higher = (cached.alternatives || []).filter(variant => variantArea(variant) > variantArea(cached.variant));
+        const candidates = chooseCandidates(higher, target, cached.qualityRound++);
+        cached.nextQualityProbe = now() + qualityProbeIntervalMs;
+        if (!candidates.length) return;
+        const controller = new env.AbortController();
+        controllers.add(controller);
+        stream.qualityController = controller;
+        const timer = env.setTimeout(() => controller.abort(), config.requestTimeoutMs);
+        const epoch = context.epoch;
+        const generation = stream.generation;
+        const job = probeVariants(candidates, controller.signal).then(result => {
+            if (!result || controller.signal.aborted || epoch !== context.epoch || generation !== stream.generation ||
+                !stream.hadAds || stream.backup !== cached || variantArea(result.variant) <= variantArea(cached.variant) ||
+                !fitsTarget(result.variant, stream.recoveryTarget || target)) return;
+            stream.backup = { ...result, alternatives: cached.alternatives, qualityRound: 0, nextQualityProbe: now() + qualityProbeIntervalMs };
+        }).catch(() => {}).finally(() => {
+            env.clearTimeout(timer);
+            controllers.delete(controller);
+            if (stream.qualityController === controller) stream.qualityController = null;
+            if (stream.qualityJob === job) stream.qualityJob = null;
+        });
+        stream.qualityJob = job;
+    }
+
     function scheduleRecovery(stream, target) {
         if (stream.retryTimer || !target?.Url || stopped || !stream.hadAds) return;
         const epoch = context.epoch;
@@ -1297,16 +1422,19 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         stream.retryTimer = env.setTimeout(async () => {
             stream.retryTimer = null;
             if (epoch !== context.epoch || !liveChannel(stream.id) || !stream.hadAds) return;
+            const currentTarget = stream.recoveryTarget || target;
             const controller = new env.AbortController();
             controllers.add(controller);
             try {
-                const text = await auxiliary(target.Url, controller.signal);
+                const text = await auxiliary(currentTarget.Url, controller.signal);
                 if (epoch !== context.epoch || generation !== stream.generation || !stream.hadAds) return;
-                const inspection = hls.inspectMedia(text, target.Url);
+                const inspection = hls.inspectMedia(text, currentTarget.Url);
                 if (!inspection.hasAds && !simulateAds) {
                     stream.generation++;
                     stream.searchController?.abort();
+                    stream.qualityController?.abort();
                     stream.hadAds = false;
+                    stream.recoveryTarget = null;
                     stream.codecFallback = false;
                     stream.backup = null;
                     stream.attempt = 0;
@@ -1316,7 +1444,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                     return;
                 }
                 const wasWaiting = stream.state !== 'playing';
-                const result = await backupText(stream, target);
+                const result = await backupText(stream, currentTarget);
                 if (epoch === context.epoch && result && wasWaiting) send('reload');
             } catch {
                 if (epoch !== context.epoch || generation !== stream.generation) return;
@@ -1324,15 +1452,15 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                 stream.nextRetry = now() + config.retryDelaysMs[index];
             } finally {
                 controllers.delete(controller);
-                if (epoch === context.epoch && generation === stream.generation && stream.hadAds) scheduleRecovery(stream, target);
+                if (epoch === context.epoch && generation === stream.generation && stream.hadAds) scheduleRecovery(stream, currentTarget);
             }
         }, Math.max(config.retryDelaysMs[0], stream.nextRetry - now()));
     }
 
     async function backupText(stream, target) {
         const cached = stream.backup;
-        if (cached && cached.variant?.Resolution === target?.Resolution &&
-            codecFamily(cached.variant?.Codecs) === codecFamily(target?.Codecs)) {
+        if (cached && fitsTarget(cached.variant, target)) {
+            improveQuality(stream, cached, target);
             // Deduplicate simultaneous playlist requests; never replay a stale playlist indefinitely.
             if (now() - cached.at < 500) return cached.text;
             if (!stream.job) {
@@ -1352,12 +1480,15 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                 stream.job = job;
             }
             const refreshed = await stream.job;
-            if (refreshed) return refreshed.text;
+            // A background promotion may finish while this lower-quality poll is pending.
+            if (stream.backup !== cached && stream.backup && fitsTarget(stream.backup.variant, target)) return backupText(stream, target);
+            if (refreshed && fitsTarget(refreshed.variant, target)) return refreshed.text;
+            stream.qualityController?.abort();
             stream.backup = null;
         }
         const result = await beginSearch(stream, target);
         // A concurrent request can target a different quality. Never serve it the wrong codec.
-        if (result && codecFamily(result.variant.Codecs) === codecFamily(target?.Codecs)) return result.text;
+        if (result && fitsTarget(result.variant, target)) return result.text;
         return null;
     }
 
@@ -1376,9 +1507,11 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             if (stream.hadAds) {
                 stream.generation++;
                 stream.searchController?.abort();
+                stream.qualityController?.abort();
                 env.clearTimeout(stream.retryTimer);
                 stream.retryTimer = null;
                 stream.hadAds = false;
+                stream.recoveryTarget = null;
                 stream.backup = null;
                 stream.nextRetry = 0;
                 stream.attempt = 0;
@@ -1390,6 +1523,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             return inspection.sanitizedText;
         }
         stream.hadAds = true;
+        stream.recoveryTarget = variant;
         const generation = stream.generation;
         for (const segment of inspection.segments) if (segment.isAd) remember(blockedSegments, segment.url, {});
         if (codecFamily(variant?.Codecs) === 'hevc' && !stream.codecFallback &&
@@ -1624,7 +1758,7 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
             else if (message.type === 'cancel-token' && Number.isSafeInteger(message.id)) record.requests.get(message.id)?.abort();
             else if (message.type === 'status' && ['playing', 'searching', 'waiting-ad', 'resuming', 'error'].includes(message.state)) {
                 controller.setStatus({ state: message.state, hasAds: message.hasAds === true });
-            } else if (message.type === 'reload' && context.kind === 'live') controller.task({ reload: true });
+            } else if (message.type === 'reload' && context.kind === 'live') controller.task({ reload: true, adRecovery: true });
             else if (message.type === 'vod-ranges' && Array.isArray(message.ranges) && message.ranges.length <= 1000) {
                 controller.setVodRanges({ id: message.id, epoch: message.epoch, ranges: message.ranges, timelineReliable: message.timelineReliable === true });
             } else if (message.type === 'diagnostic') diagnostic(message.code);

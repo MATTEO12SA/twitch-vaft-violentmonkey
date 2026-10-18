@@ -14,6 +14,9 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
     const blockedSegments = new Map();
     const controllers = new Set();
     const processedResponses = new WeakSet();
+    const qualityProbeIntervalMs = 8000;
+    const variantProbeTimeoutMs = 2000;
+    const candidateLimit = 4;
     const now = () => env.Date ? env.Date.now() : Date.now();
     const error = name => new env.DOMException(name, name);
     const send = (type, data = {}) => env.postMessage({ namespace: protocol, workerId, epoch: context.epoch, type, ...data });
@@ -69,12 +72,16 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             if (next.kind === stream.kind && String(next.id).toLowerCase() === String(id).toLowerCase()) {
                 stream.epoch = next.epoch;
                 stream.job = null;
+                stream.qualityJob = null;
             } else streams.delete(id);
         }
         for (const [url, entry] of media) if (!streams.has(entry.stream.id)) media.delete(url);
         blockedSegments.clear();
         context = { ...next };
         simulateAds = false;
+        // An empty waiting manifest can stop native polling. Re-arm the retained
+        // channel's recovery under the new epoch when its video/decoder changes.
+        for (const stream of streams.values()) if (stream.hadAds) scheduleRecovery(stream, stream.recoveryTarget);
     }
 
     function onMessage(event) {
@@ -100,7 +107,8 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         if (!stream) {
             stream = { id, kind: kind.kind === 'live-master' ? 'live' : 'vod', url: url.href,
                 epoch, state: 'playing', attempt: 0, nextRetry: 0, job: null, backup: null,
-                hadAds: false, codecFallback: false, variants, retryTimer: null, generation: 0, at: now() };
+                qualityJob: null, qualityController: null,
+                hadAds: false, codecFallback: false, variants, retryTimer: null, recoveryTarget: null, generation: 0, at: now() };
             streams.set(id, stream);
         }
         stream.url = url.href;
@@ -166,15 +174,94 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         return ['#EXTM3U', version, target, sequence, ''].join('\n');
     }
 
-    async function auxiliary(url, signal) {
-        const result = await net.requestText(realFetch, url, { signal }, config.requestTimeoutMs);
+    async function auxiliary(url, signal, timeoutMs = config.requestTimeoutMs) {
+        const result = await net.requestText(realFetch, url, { signal }, timeoutMs);
         if (!result.response.ok || !result.text.trimStart().startsWith('#EXTM3U')) throw error('DataError');
         return result.text;
     }
 
+    function variantArea(variant) {
+        const size = String(variant?.Resolution || '').match(/^(\d+)x(\d+)$/i);
+        const area = size ? Number(size[1]) * Number(size[2]) : 0;
+        return Number.isFinite(area) ? area : 0;
+    }
+
+    function compatibleVariants(variants, target) {
+        const family = codecFamily(target?.Codecs);
+        if (!family) return [];
+        const urls = new Set();
+        return variants.filter(variant => {
+            if (!variant.Url || urls.has(variant.Url) || !variantArea(variant) || codecFamily(variant.Codecs) !== family) return false;
+            urls.add(variant.Url);
+            return true;
+        });
+    }
+
+    function fitsTarget(variant, target) {
+        const area = variantArea(variant);
+        const limit = variantArea(target);
+        const family = codecFamily(target?.Codecs);
+        return !!family && codecFamily(variant?.Codecs) === family && area > 0 && (!limit || area <= limit);
+    }
+
+    function chooseCandidates(variants, target, round = 0) {
+        const pool = variants.filter(variant => fitsTarget(variant, target));
+        const preferred = hls.selectVariant(pool, target || {});
+        if (!preferred) return [];
+        const chosen = [preferred];
+        const remaining = pool.filter(variant => variant.Url !== preferred.Url)
+            .sort((a, b) => variantArea(b) - variantArea(a));
+        // Always consider a small usable picture, even when the highest quality stalls.
+        if (remaining.length) chosen.push(remaining.pop());
+        const offset = remaining.length ? (round * (candidateLimit - 2)) % remaining.length : 0;
+        const count = Math.min(candidateLimit - chosen.length, remaining.length);
+        for (let index = 0; index < count; index++) {
+            chosen.push(remaining[(offset + index) % remaining.length]);
+        }
+        return chosen;
+    }
+
+    async function probeVariants(candidates, signal) {
+        if (!candidates.length) return null;
+        const controller = new env.AbortController();
+        const onAbort = () => controller.abort();
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) controller.abort();
+        let index = 0;
+        const probe = async () => {
+            while (!controller.signal.aborted && index < candidates.length) {
+                const variant = candidates[index++];
+                try {
+                    // Release a stalled slot soon enough to try intermediate qualities
+                    // within the outer search's unchanged total deadline.
+                    const text = await auxiliary(variant.Url, controller.signal, Math.min(variantProbeTimeoutMs, config.requestTimeoutMs));
+                    const inspection = hls.inspectMedia(text, variant.Url);
+                    if (!inspection.hasAds && !simulateAds && inspection.segments.length) {
+                        return { url: variant.Url, variant, text: absolutize(inspection.sanitizedText, variant.Url), at: now() };
+                    }
+                } catch (failure) {
+                    if (controller.signal.aborted) throw failure;
+                }
+            }
+            throw error('DataError');
+        };
+        try {
+            // Only two requests run at once; the first clean result releases the player.
+            return await Promise.any(Array.from({ length: Math.min(2, candidates.length) }, probe));
+        } catch (failure) {
+            if (signal.aborted) throw error('AbortError');
+            return null;
+        } finally {
+            signal.removeEventListener('abort', onAbort);
+            controller.abort();
+        }
+    }
+
     async function search(stream, target, signal) {
         // One total deadline also bounds the sequence of fallback requests.
-        for (const playerType of config.backupPlayerTypes) {
+        // Rotate the first profile so one stalled token/master cannot starve the rest.
+        for (let index = 0; index < config.backupPlayerTypes.length; index++) {
+            const playerType = config.backupPlayerTypes[(stream.attempt + index) % config.backupPlayerTypes.length];
             if (signal.aborted || stream.epoch !== context.epoch) throw error('AbortError');
             try {
                 const access = await token(stream.id, playerType, signal);
@@ -185,14 +272,9 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                 const master = await auxiliary(url.href, signal);
                 const variants = hls.parseMaster(master, url.href);
                 // Do not splice incompatible codecs into a running decoder.
-                const family = codecFamily(target?.Codecs);
-                const compatible = family ? variants.filter(item => codecFamily(item.Codecs) === family) : variants;
-                const variant = hls.selectVariant(compatible, target || {});
-                if (!variant) continue;
-                const text = await auxiliary(variant.Url, signal);
-                const inspection = hls.inspectMedia(text, variant.Url);
-                if (inspection.hasAds || simulateAds || !inspection.segments.length) continue;
-                return { url: variant.Url, variant, text: absolutize(inspection.sanitizedText, variant.Url), at: now() };
+                const compatible = compatibleVariants(variants, target);
+                const result = await probeVariants(chooseCandidates(compatible, target, stream.attempt), signal);
+                if (result) return { ...result, alternatives: compatible, qualityRound: 0, nextQualityProbe: now() + qualityProbeIntervalMs };
             } catch (failure) {
                 if (signal.aborted) throw failure;
             }
@@ -203,6 +285,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
     function beginSearch(stream, target) {
         if (stream.job) return stream.job;
         if (now() < stream.nextRetry) return Promise.resolve(null);
+        stream.qualityController?.abort();
         status(stream, 'searching', true);
         const controller = new env.AbortController();
         controllers.add(controller);
@@ -234,6 +317,32 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         return job;
     }
 
+    function improveQuality(stream, cached, target) {
+        if (stream.qualityJob || now() < cached.nextQualityProbe || !stream.hadAds) return;
+        const higher = (cached.alternatives || []).filter(variant => variantArea(variant) > variantArea(cached.variant));
+        const candidates = chooseCandidates(higher, target, cached.qualityRound++);
+        cached.nextQualityProbe = now() + qualityProbeIntervalMs;
+        if (!candidates.length) return;
+        const controller = new env.AbortController();
+        controllers.add(controller);
+        stream.qualityController = controller;
+        const timer = env.setTimeout(() => controller.abort(), config.requestTimeoutMs);
+        const epoch = context.epoch;
+        const generation = stream.generation;
+        const job = probeVariants(candidates, controller.signal).then(result => {
+            if (!result || controller.signal.aborted || epoch !== context.epoch || generation !== stream.generation ||
+                !stream.hadAds || stream.backup !== cached || variantArea(result.variant) <= variantArea(cached.variant) ||
+                !fitsTarget(result.variant, stream.recoveryTarget || target)) return;
+            stream.backup = { ...result, alternatives: cached.alternatives, qualityRound: 0, nextQualityProbe: now() + qualityProbeIntervalMs };
+        }).catch(() => {}).finally(() => {
+            env.clearTimeout(timer);
+            controllers.delete(controller);
+            if (stream.qualityController === controller) stream.qualityController = null;
+            if (stream.qualityJob === job) stream.qualityJob = null;
+        });
+        stream.qualityJob = job;
+    }
+
     function scheduleRecovery(stream, target) {
         if (stream.retryTimer || !target?.Url || stopped || !stream.hadAds) return;
         const epoch = context.epoch;
@@ -241,16 +350,19 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         stream.retryTimer = env.setTimeout(async () => {
             stream.retryTimer = null;
             if (epoch !== context.epoch || !liveChannel(stream.id) || !stream.hadAds) return;
+            const currentTarget = stream.recoveryTarget || target;
             const controller = new env.AbortController();
             controllers.add(controller);
             try {
-                const text = await auxiliary(target.Url, controller.signal);
+                const text = await auxiliary(currentTarget.Url, controller.signal);
                 if (epoch !== context.epoch || generation !== stream.generation || !stream.hadAds) return;
-                const inspection = hls.inspectMedia(text, target.Url);
+                const inspection = hls.inspectMedia(text, currentTarget.Url);
                 if (!inspection.hasAds && !simulateAds) {
                     stream.generation++;
                     stream.searchController?.abort();
+                    stream.qualityController?.abort();
                     stream.hadAds = false;
+                    stream.recoveryTarget = null;
                     stream.codecFallback = false;
                     stream.backup = null;
                     stream.attempt = 0;
@@ -260,7 +372,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                     return;
                 }
                 const wasWaiting = stream.state !== 'playing';
-                const result = await backupText(stream, target);
+                const result = await backupText(stream, currentTarget);
                 if (epoch === context.epoch && result && wasWaiting) send('reload');
             } catch {
                 if (epoch !== context.epoch || generation !== stream.generation) return;
@@ -268,15 +380,15 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                 stream.nextRetry = now() + config.retryDelaysMs[index];
             } finally {
                 controllers.delete(controller);
-                if (epoch === context.epoch && generation === stream.generation && stream.hadAds) scheduleRecovery(stream, target);
+                if (epoch === context.epoch && generation === stream.generation && stream.hadAds) scheduleRecovery(stream, currentTarget);
             }
         }, Math.max(config.retryDelaysMs[0], stream.nextRetry - now()));
     }
 
     async function backupText(stream, target) {
         const cached = stream.backup;
-        if (cached && cached.variant?.Resolution === target?.Resolution &&
-            codecFamily(cached.variant?.Codecs) === codecFamily(target?.Codecs)) {
+        if (cached && fitsTarget(cached.variant, target)) {
+            improveQuality(stream, cached, target);
             // Deduplicate simultaneous playlist requests; never replay a stale playlist indefinitely.
             if (now() - cached.at < 500) return cached.text;
             if (!stream.job) {
@@ -296,12 +408,15 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                 stream.job = job;
             }
             const refreshed = await stream.job;
-            if (refreshed) return refreshed.text;
+            // A background promotion may finish while this lower-quality poll is pending.
+            if (stream.backup !== cached && stream.backup && fitsTarget(stream.backup.variant, target)) return backupText(stream, target);
+            if (refreshed && fitsTarget(refreshed.variant, target)) return refreshed.text;
+            stream.qualityController?.abort();
             stream.backup = null;
         }
         const result = await beginSearch(stream, target);
         // A concurrent request can target a different quality. Never serve it the wrong codec.
-        if (result && codecFamily(result.variant.Codecs) === codecFamily(target?.Codecs)) return result.text;
+        if (result && fitsTarget(result.variant, target)) return result.text;
         return null;
     }
 
@@ -320,9 +435,11 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             if (stream.hadAds) {
                 stream.generation++;
                 stream.searchController?.abort();
+                stream.qualityController?.abort();
                 env.clearTimeout(stream.retryTimer);
                 stream.retryTimer = null;
                 stream.hadAds = false;
+                stream.recoveryTarget = null;
                 stream.backup = null;
                 stream.nextRetry = 0;
                 stream.attempt = 0;
@@ -334,6 +451,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             return inspection.sanitizedText;
         }
         stream.hadAds = true;
+        stream.recoveryTarget = variant;
         const generation = stream.generation;
         for (const segment of inspection.segments) if (segment.isAd) remember(blockedSegments, segment.url, {});
         if (codecFamily(variant?.Codecs) === 'hevc' && !stream.codecFallback &&

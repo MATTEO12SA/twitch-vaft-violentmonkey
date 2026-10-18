@@ -269,6 +269,21 @@ test('bridge ignores foreign, stale and invalid requests and only constructs its
     assert.equal(worker.posted.at(-1).id, 2);
 });
 
+test('only a current live Worker can request recovery of an unstarted player', t => {
+    const h = setup(t);
+    const { worker } = h.createWorker();
+    worker.run();
+    for (const override of [{ namespace: 'unrelated' }, { workerId: 999 }, { epoch: 0 }]) {
+        h.send(worker, { type: 'reload', ...override });
+    }
+    assert.deepEqual(h.tasks, []);
+    h.send(worker, { type: 'reload' });
+    assert.deepEqual(h.tasks, [{ reload: true, adRecovery: true }]);
+    h.changeContext({ kind: 'vod', id: '123', epoch: 2 });
+    h.send(worker, { type: 'reload' });
+    assert.equal(h.tasks.length, 1, 'VOD must not inherit live ad recovery');
+});
+
 test('context change cancels outstanding relay and discards its late response', async t => {
     let complete;
     let requestSignal;

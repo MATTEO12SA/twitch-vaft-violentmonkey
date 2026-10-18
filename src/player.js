@@ -16,7 +16,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     // No unverified signatures: never hide Twitch's native error/anti-adblock UI.
     const verifiedOverlayRules = Object.freeze([]);
     const reservedRoutes = new Set(['directory', 'downloads', 'inventory', 'jobs', 'login', 'logout', 'search', 'settings', 'signup', 'subscriptions', 'turbo', 'videos', 'wallet', 'collections', 'p', 'friends', 'messages', 'moderator', 'dashboard']);
-    const videoEvents = ['play', 'pause', 'ended', 'loadedmetadata', 'emptied', 'timeupdate', 'seeking', 'seeked'];
+    const videoEvents = ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'emptied', 'timeupdate', 'seeking', 'seeked'];
     const metrics = { scans: 0, reactScans: 0, ticks: 0, tasks: 0, vodSkips: 0, contexts: 0, diagnostics: 0 };
     const diagnosticTimes = new Map();
     let running = false;
@@ -33,10 +33,12 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     let context = { kind: 'unknown', id: null, epoch: 0 };
     let status = { state: 'playing', hasAds: false, isMidroll: false };
     let reactCache;
+    let reactCacheRetryAt = 0;
     let lastTaskAt = -Infinity;
     let internalAction = false;
     let expectedPause = null;
     let intentionalPause = false;
+    let mediaWasLoaded = false;
     let restore = null;
     let progress = { position: null, at: 0, started: false };
     let vod = { ranges: [], reliable: false, attempts: new Set(), position: null, pausedByUs: false, expectedSeek: null };
@@ -103,15 +105,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
             banner.style.cssText = 'position:absolute;top:0;left:0;z-index:2;padding:5px 8px;color:white;background:rgba(0,0,0,.8);font:12px sans-serif;pointer-events:none;';
             container.appendChild(banner);
         }
-        const labels = {
-            searching: 'VAFT : recherche d’un flux sans publicité…',
-            'waiting-ad': 'VAFT : publicité bloquée, en attente d’un flux utilisable…',
-            waiting: 'VAFT : publicité bloquée, en attente d’un flux utilisable…',
-            awaiting: 'VAFT : publicité bloquée, en attente d’un flux utilisable…',
-            resuming: 'VAFT : reprise de la lecture…',
-            error: 'VAFT : récupération du lecteur indisponible.'
-        };
-        const label = labels[status.state] || 'VAFT : blocage des publicités';
+        const label = status.state === 'error' ? 'Récupération du lecteur indisponible.' : 'Pub bloquée';
         if (banner.textContent !== label) banner.textContent = label;
         banner.style.display = 'block';
     }
@@ -130,11 +124,16 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         restore = null;
     }
 
-    function bindVideo(nextVideo) {
+    function bindVideo(nextVideo, preservePause = false) {
         if (video === nextVideo) return false;
+        const retainedPause = preservePause && intentionalPause;
         if (video) videoEvents.forEach(event => video.removeEventListener(event, onVideoEvent));
         video = nextVideo;
-        intentionalPause = restore ? restore.paused : !!video?.paused;
+        mediaWasLoaded = !!video && (video.readyState > 0 || video.currentTime > 0);
+        const initialBuffering = !!video && video.readyState === 0 && video.currentTime === 0;
+        // A fresh HAVE_NOTHING video is paused by default. All subsequent pause
+        // events remain protected, including a pause before metadata arrives.
+        intentionalPause = retainedPause || (restore ? restore.paused : !!video?.paused && !initialBuffering);
         expectedPause = null;
         reactCache = undefined;
         progress = { position: null, at: now(), started: false };
@@ -165,9 +164,11 @@ function createPlayerController(env, options = {}, callbacks = {}) {
             if (videos.length === 1) { nextContainer = players[0]; nextVideo = videos[0]; }
         }
         if (container !== nextContainer) { removeBanner(); container = nextContainer; }
-        const mediaChanged = bindVideo(nextVideo);
         const nextRoute = pathname();
         if (nextRoute !== route) restore = null;
+        // Replacing the DOM video on one route is not a new request to play,
+        // even if the old element disappears before its replacement arrives.
+        const mediaChanged = bindVideo(nextVideo, nextRoute === route);
         route = nextRoute;
         dirty = false;
         changeContext(ambiguous ? { kind: 'unknown', id: null } : classify(route), mediaChanged);
@@ -216,6 +217,9 @@ function createPlayerController(env, options = {}, callbacks = {}) {
 
     function onVideoEvent(event) {
         if (!running || suspended || event.target !== video) return;
+        if (video.readyState > 0 || video.currentTime > 0 || event.type === 'loadedmetadata' || event.type === 'playing') {
+            mediaWasLoaded = true;
+        }
         const ownPause = event.type === 'pause' && expectedPause === video;
         if (ownPause) expectedPause = null;
         if (!internalAction && !ownPause && event.type === 'pause') {
@@ -224,6 +228,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
             if (restore) restore.paused = true;
         } else if (!internalAction && event.type === 'play') {
             intentionalPause = false;
+            if (restore) restore.paused = false;
         }
         if (event.type === 'seeking' && !internalAction && video.paused &&
             !(vod.expectedSeek !== null && Math.abs(video.currentTime - vod.expectedSeek) < 0.25)) {
@@ -250,8 +255,13 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     function getPlayerAndState() {
         refresh();
         if (!video || !container) return null;
-        if (reactCache !== undefined) return { ...reactCache, video, container };
+        // React may hydrate after the video appears. Retry incomplete associations
+        // only when needed, at the recovery cadence, instead of on every tick.
+        if (reactCache !== undefined && ((reactCache.player && reactCache.state) || now() < reactCacheRetryAt)) {
+            return { ...reactCache, video, container };
+        }
         metrics.reactScans++;
+        reactCacheRetryAt = now() + config.minReloadMs;
         const stack = [reactRoot()].filter(Boolean);
         const seen = new Set();
         const players = new Set();
@@ -282,12 +292,17 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         return { ...reactCache, video, container };
     }
 
-    function task({ reload = false, pausePlay = false } = {}) {
+    function task({ reload = false, pausePlay = false, adRecovery = false } = {}) {
         refresh();
-        if (!running || suspended || !video || context.kind !== 'live' || video.paused || video.ended || intentionalPause) return false;
+        if (!running || suspended || !video || context.kind !== 'live' || video.ended || intentionalPause) return false;
+        if (video.readyState > 0 || video.currentTime > 0) mediaWasLoaded = true;
+        const startupRecovery = reload && adRecovery === true && !mediaWasLoaded && video.readyState === 0 && video.currentTime === 0;
+        if (video.paused && !startupRecovery) return false;
         if ((!reload && !pausePlay) || now() - lastTaskAt < config.minReloadMs) return false;
         const current = getPlayerAndState();
-        const settings = { muted: video.muted, volume: video.volume, paused: video.paused };
+        // Reload may let the player start naturally; never restore its default
+        // startup pause as user intent and never issue play() for this recovery.
+        const settings = { muted: video.muted, volume: video.volume, paused: video.paused && !startupRecovery };
         const target = current?.player && typeof current.player.pause === 'function' && typeof current.player.play === 'function' ? current.player : video;
         if (reload && !current?.state) { diagnose('reload-unavailable'); return false; }
         try {

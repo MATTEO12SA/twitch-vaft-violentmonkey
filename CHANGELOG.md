@@ -1,6 +1,17 @@
 # Historique
 
-## 37.0.3 — en validation
+## 37.0.4 — candidate, essais réels à refaire
+
+- Recherche bornée de plusieurs résolutions compatibles, avec priorité à un secours propre disponible rapidement, même en faible qualité.
+- Secours réduit conservé entre demandes de qualité compatibles ; amélioration en arrière-plan sans interrompre sa lecture. Résultats devenus obsolètes après changement de média, de qualité ou fin de publicité ignorés.
+- Reprise des tentatives publicitaires après remplacement du lecteur sur la même chaîne ; récupération du démarrage encore sans média, sans reprendre une pause volontaire.
+- Association React incomplète réessayée à cadence limitée. Pause conservée lors du remplacement d’une vidéo sur la même route ; une reprise manuelle récente prime sur l’ancienne pause mémorisée pendant une restauration.
+- Indication publicitaire raccourcie à « Pub bloquée ». Erreurs techniques distinctes et absence de masquage des erreurs Twitch.
+- Numéro de version chargé lisible sans debug ; identité Violentmonkey et URL de mise à jour inchangées.
+
+Les tests automatisés couvrent ces régressions. Les observations Edge précédentes portent sur 37.0.3 : la nouvelle candidate doit encore être installée et testée. Aucun blocage publicitaire VOD n’est annoncé.
+
+## 37.0.3 — candidate précédente, non distribuée sur main
 
 - Modules locaux et build reproductible vers un userscript unique, sans dépendance distante.
 - Requêtes compatibles avec `Request`, `URL` et `Headers`, lecture et annulation bornées ; modifications GraphQL limitées au direct.

@@ -1,6 +1,6 @@
 // Build-time configuration. No remote dependencies are loaded by VAFT.
 const config = {
-    version: '37.0.3',
+    version: '37.0.4',
     debug: false,
     vodAdSkipping: false,
     forcePlayerType: 'popout',

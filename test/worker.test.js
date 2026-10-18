@@ -164,6 +164,401 @@ test('clean fallback resolves relative media and key URLs and preserves HTTP met
     await f.dispose();
 });
 
+test('clean low-resolution fallback is preferred to waiting and reused on later playlist polls', async () => {
+    const highURL = 'https://video.example.invalid/backup/high.m3u8';
+    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
+    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
+    const f = setup({ token: 'success', fetch: async url => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) return new Response(fallback);
+        return new Response(url === lowURL ? clean : ad);
+    } });
+    await f.env.fetch(masterURL);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /backup\/normal\.ts/);
+    assert.equal(f.messages.filter(message => message.type === 'token').length, 1);
+    await f.advance(501);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /backup\/normal\.ts/);
+    assert.equal(f.messages.filter(message => message.type === 'token').length, 1, 'reuse the clean lower quality without a new token search');
+    assert.equal(f.calls.filter(call => call.url === lowURL).length, 2);
+    assert.equal(f.engine.getDiagnostics().recoveryTimers, 0);
+    await f.dispose();
+});
+
+test('a slow high-quality probe cannot delay a clean compatible low-quality stream', async () => {
+    const highURL = 'https://video.example.invalid/backup/slow.m3u8';
+    const lowURL = 'https://video.example.invalid/backup/fast.m3u8';
+    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '640x360');
+    let slowSignal;
+    const f = setup({ token: 'success', fetch: async (url, init) => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) return new Response(fallback);
+        if (url === highURL) { slowSignal = init.signal; return new Promise(() => {}); }
+        return new Response(url === lowURL ? clean : ad);
+    } });
+    await f.env.fetch(masterURL);
+    const reading = f.env.fetch(mediaURL);
+    await flush();
+    assert.ok(f.calls.some(call => call.url === lowURL), 'the lower quality is probed while high quality is pending');
+    assert.match(await (await reading).text(), /backup\/normal\.ts/);
+    assert.equal(slowSignal.aborted, true);
+    assert.equal(f.engine.getDiagnostics().controllers, 0);
+    await f.dispose();
+});
+
+test('stalled highest and lowest probes release their slots for a clean intermediate quality', async () => {
+    const highURL = 'https://video.example.invalid/backup/high.m3u8';
+    const midURL = 'https://video.example.invalid/backup/mid.m3u8';
+    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
+    const fallback = master(highURL) + master(midURL).replace('#EXTM3U\n', '').replace('1920x1080', '640x360') + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
+    const stalled = [];
+    const f = setup({ token: 'success', fetch: async (url, init) => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) return new Response(fallback);
+        if (url === highURL || url === lowURL) { stalled.push(init.signal); return new Promise(() => {}); }
+        return new Response(url === midURL ? clean.replace('normal.ts', 'mid.ts') : ad);
+    } });
+    await f.env.fetch(masterURL);
+    const reading = f.env.fetch(mediaURL);
+    await flush();
+    assert.equal(stalled.length, 2);
+    await f.advance(2000);
+    assert.ok(f.calls.some(call => call.url === midURL), 'a stalled pair cannot starve the intermediate variant');
+    assert.match(await (await reading).text(), /mid\.ts/);
+    assert.equal(stalled.every(signal => signal.aborted), true);
+    assert.equal(f.messages.some(message => message.type === 'status' && message.state === 'waiting-ad'), false);
+    assert.equal(f.engine.getDiagnostics().controllers, 0);
+    await f.dispose();
+});
+
+test('an AVC refresh cannot reuse the result of a concurrent AV1 fallback search', async () => {
+    const av1Live = 'https://video.example.invalid/live/av1.m3u8';
+    const avcBackup = 'https://video.example.invalid/backup/avc.m3u8';
+    const av1Backup = 'https://video.example.invalid/backup/av1.m3u8';
+    const original = master() + master(av1Live, 'av01.0.08M.08').replace('#EXTM3U\n', '');
+    const fallback = master(avcBackup) + master(av1Backup, 'av01.0.08M.08').replace('#EXTM3U\n', '');
+    let releaseAV1;
+    const f = setup({ token: 'success', fetch: async url => {
+        if (url === masterURL) return new Response(original);
+        if (url.includes('usher')) return new Response(fallback);
+        if (url === avcBackup) return new Response(clean.replace('normal.ts', 'avc.ts'));
+        if (url === av1Backup) return new Promise(resolve => { releaseAV1 = resolve; });
+        return new Response(ad);
+    } });
+    await f.env.fetch(masterURL);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /avc\.ts/);
+    await f.advance(501);
+    const av1Reading = f.env.fetch(av1Live);
+    await flush();
+    const avcReading = f.env.fetch(mediaURL);
+    await flush();
+    releaseAV1(new Response(clean.replace('normal.ts', 'av1.ts')));
+    assert.match(await (await av1Reading).text(), /av1\.ts/);
+    const avcText = await (await avcReading).text();
+    assert.match(avcText, /avc\.ts/);
+    assert.doesNotMatch(avcText, /av1\.ts|ad\.ts/);
+    await f.dispose();
+});
+
+test('quality candidates are bounded, include the lowest resolution, and rotate through intermediate levels', async () => {
+    const heights = [1080, 900, 720, 540, 480, 360, 160];
+    const urls = heights.map(height => `https://video.example.invalid/backup/${height}.m3u8`);
+    const fallback = '#EXTM3U\n' + urls.map((url, index) => master(url).replace('#EXTM3U\n', '').replace('1920x1080', `${heights[index] * 2}x${heights[index]}`)).join('');
+    let concurrent = 0;
+    let peak = 0;
+    const f = setup({ token: 'success', options: { backupPlayerTypes: ['embed'] }, fetch: async url => {
+        if (url === masterURL) return new Response(master().replace('1920x1080', '2160x1080'));
+        if (url.includes('usher')) return new Response(fallback);
+        if (urls.includes(url)) {
+            peak = Math.max(peak, ++concurrent);
+            await Promise.resolve();
+            concurrent--;
+        }
+        return new Response(ad);
+    } });
+    await f.env.fetch(masterURL);
+    assert.doesNotMatch(await (await f.env.fetch(mediaURL)).text(), /ad\.ts/);
+    let probes = f.calls.filter(call => urls.includes(call.url));
+    assert.equal(probes.length, 4);
+    assert.ok(probes.some(call => call.url === urls[0]));
+    assert.ok(probes.some(call => call.url === urls.at(-1)));
+    assert.equal(peak, 2);
+    await f.advance(2000);
+    await f.advance(4000);
+    probes = f.calls.filter(call => urls.includes(call.url));
+    assert.equal(probes.length, 12);
+    assert.equal(new Set(probes.map(call => call.url)).size, urls.length);
+    assert.equal(peak, 2);
+    await f.dispose();
+});
+
+test('fallback never exceeds the requested resolution or substitutes another codec or audio-only variant', async () => {
+    const highURL = 'https://video.example.invalid/backup/1080.m3u8';
+    const av1URL = 'https://video.example.invalid/backup/av1.m3u8';
+    const audioURL = 'https://video.example.invalid/backup/audio.m3u8';
+    const lowURL = 'https://video.example.invalid/backup/160.m3u8';
+    const fallback = master(highURL) + master(av1URL, 'av01.0.08M.08').replace('#EXTM3U\n', '') + master(audioURL, 'mp4a.40.2').replace('#EXTM3U\n', '').replace(',RESOLUTION=1920x1080', '') + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
+    const f = setup({ token: 'success', fetch: async url => {
+        if (url === masterURL) return new Response(master().replace('1920x1080', '1280x720'));
+        if (url.includes('usher')) return new Response(fallback);
+        return new Response(url === mediaURL ? ad : clean);
+    } });
+    await f.env.fetch(masterURL);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /backup\/normal\.ts/);
+    assert.equal(f.calls.some(call => [highURL, av1URL, audioURL].includes(call.url)), false);
+    await f.dispose();
+});
+
+test('background quality improvement keeps low video playing, bounds slow probes, and promotes a clean higher variant', async () => {
+    const highURL = 'https://video.example.invalid/backup/high.m3u8';
+    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
+    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
+    let mode = 'ad';
+    let highSignal;
+    const f = setup({ token: 'success', fetch: async (url, init) => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) return new Response(fallback);
+        if (url === highURL) {
+            if (mode === 'hang') { highSignal = init.signal; return new Promise(() => {}); }
+            return new Response(mode === 'clean' ? clean.replace('normal.ts', 'high.ts') : ad);
+        }
+        return new Response(url === lowURL ? clean.replace('normal.ts', 'low.ts') : ad);
+    } });
+    await f.env.fetch(masterURL);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+    mode = 'hang';
+    await f.advance(7999);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+    assert.equal(f.calls.filter(call => call.url === highURL).length, 1);
+    await f.advance(1);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+    assert.equal(f.calls.filter(call => call.url === highURL).length, 2);
+    await f.advance(1000);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+    assert.equal(f.calls.filter(call => call.url === highURL).length, 2);
+    await f.advance(7000);
+    assert.equal(highSignal.aborted, true);
+    assert.equal(f.engine.getDiagnostics().controllers, 0);
+    mode = 'clean';
+    await f.env.fetch(mediaURL);
+    await flush();
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /high\.ts/);
+    assert.equal(f.messages.filter(message => message.type === 'token').length, 1);
+    assert.equal(f.engine.getDiagnostics().controllers, 0);
+    await f.dispose();
+});
+
+test('late quality probes cannot promote across a media epoch or the end of an ad', async () => {
+    for (const boundary of ['replacement', 'ad-end']) {
+        const highURL = 'https://video.example.invalid/backup/high.m3u8';
+        const lowURL = 'https://video.example.invalid/backup/low.m3u8';
+        const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
+        let content = ad;
+        let deferHigh = false;
+        let releaseHigh;
+        let highSignal;
+        const f = setup({ token: 'success', fetch: async (url, init) => {
+            if (url === masterURL) return new Response(master());
+            if (url.includes('usher')) return new Response(fallback);
+            if (url === highURL && deferHigh) {
+                highSignal = init.signal;
+                return new Promise(resolve => { releaseHigh = resolve; });
+            }
+            return new Response(url === lowURL ? clean.replace('normal.ts', 'low.ts') : url === mediaURL ? content : ad);
+        } });
+        await f.env.fetch(masterURL);
+        assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+        deferHigh = true;
+        await f.advance(8000);
+        assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+        assert.equal(typeof releaseHigh, 'function');
+        if (boundary === 'replacement') f.engine.setContext({ kind: 'live', id: 'channel', epoch: 2 });
+        else {
+            content = clean;
+            assert.equal(await (await f.env.fetch(mediaURL)).text(), clean);
+        }
+        assert.equal(highSignal.aborted, true);
+        releaseHigh(new Response(clean.replace('normal.ts', 'stale-high.ts')));
+        await flush();
+        deferHigh = false;
+        content = ad;
+        assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+        assert.equal(f.engine.getDiagnostics().controllers, 0);
+        await f.dispose();
+    }
+});
+
+test('a clean promotion survives a concurrent stale lower-quality refresh failure', async () => {
+    const highURL = 'https://video.example.invalid/backup/high.m3u8';
+    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
+    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
+    let upgrade = false;
+    let releaseLow;
+    const f = setup({ token: 'success', fetch: async url => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) return new Response(fallback);
+        if (url === highURL) return new Response(upgrade ? clean.replace('normal.ts', 'high.ts') : ad);
+        if (url === lowURL && upgrade) return new Promise(resolve => { releaseLow = resolve; });
+        return new Response(url === lowURL ? clean.replace('normal.ts', 'low.ts') : ad);
+    } });
+    await f.env.fetch(masterURL);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+    upgrade = true;
+    await f.advance(8000);
+    const reading = f.env.fetch(mediaURL);
+    await flush();
+    assert.equal(typeof releaseLow, 'function');
+    releaseLow(new Response(ad));
+    assert.match(await (await reading).text(), /high\.ts/);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /high\.ts/);
+    assert.equal(f.messages.filter(message => message.type === 'token').length, 1);
+    await f.dispose();
+});
+
+test('an obsolete quality probe is cancelled when its clean backup is replaced', async () => {
+    const highURL = 'https://video.example.invalid/backup/high.m3u8';
+    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
+    const replacementURL = 'https://video.example.invalid/replacement/index.m3u8';
+    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
+    let phase = 'initial';
+    let releaseHigh;
+    let highSignal;
+    const f = setup({ token: 'success', fetch: async (url, init) => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) return new Response(phase === 'replace' ? master(replacementURL).replace('1920x1080', '640x360') : fallback);
+        if (url === highURL && phase !== 'initial') {
+            highSignal = init.signal;
+            return new Promise(resolve => { releaseHigh = resolve; });
+        }
+        if (url === replacementURL) return new Response(clean.replace('normal.ts', 'replacement.ts'));
+        if (url === lowURL && phase !== 'replace') return new Response(clean.replace('normal.ts', 'low.ts'));
+        return new Response(ad);
+    } });
+    await f.env.fetch(masterURL);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+    phase = 'upgrade';
+    await f.advance(8000);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+    phase = 'replace';
+    await f.advance(501);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /replacement\.ts/);
+    assert.equal(highSignal.aborted, true);
+    releaseHigh(new Response(clean.replace('normal.ts', 'obsolete-high.ts')));
+    await flush();
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /replacement\.ts/);
+    await f.dispose();
+});
+
+test('an in-flight upgrade cannot override a later lower resolution selection', async () => {
+    const selectedLowURL = 'https://video.example.invalid/live/360.m3u8';
+    const highURL = 'https://video.example.invalid/backup/high.m3u8';
+    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
+    const original = master() + master(selectedLowURL).replace('#EXTM3U\n', '').replace('1920x1080', '640x360');
+    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
+    let deferHigh = false;
+    let releaseHigh;
+    const f = setup({ token: 'success', fetch: async url => {
+        if (url === masterURL) return new Response(original);
+        if (url.includes('usher')) return new Response(fallback);
+        if (url === highURL && deferHigh) return new Promise(resolve => { releaseHigh = resolve; });
+        return new Response(url === lowURL ? clean.replace('normal.ts', 'low.ts') : ad);
+    } });
+    await f.env.fetch(masterURL);
+    await f.env.fetch(mediaURL);
+    deferHigh = true;
+    await f.advance(8000);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+    assert.match(await (await f.env.fetch(selectedLowURL)).text(), /low\.ts/);
+    releaseHigh(new Response(clean.replace('normal.ts', 'excess-high.ts')));
+    await flush();
+    assert.match(await (await f.env.fetch(selectedLowURL)).text(), /low\.ts/);
+    assert.equal(f.messages.filter(message => message.type === 'token').length, 1, 'the compatible low cache was retained');
+    await f.dispose();
+});
+
+test('manual high-to-low-to-high selection keeps clean compatible video and later restores higher quality', async () => {
+    const selectedLowURL = 'https://video.example.invalid/live/360.m3u8';
+    const highURL = 'https://video.example.invalid/backup/high.m3u8';
+    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
+    const original = master() + master(selectedLowURL).replace('#EXTM3U\n', '').replace('1920x1080', '640x360');
+    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
+    let lowIsClean = false;
+    const f = setup({ token: 'success', fetch: async url => {
+        if (url === masterURL) return new Response(original);
+        if (url.includes('usher')) return new Response(fallback);
+        if (url === highURL) return new Response(clean.replace('normal.ts', 'high.ts'));
+        if (url === lowURL && lowIsClean) return new Response(clean.replace('normal.ts', 'low.ts'));
+        return new Response(ad);
+    } });
+    await f.env.fetch(masterURL);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /high\.ts/);
+    lowIsClean = true;
+    assert.match(await (await f.env.fetch(selectedLowURL)).text(), /low\.ts/);
+    assert.equal(f.messages.filter(message => message.type === 'token').length, 2);
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
+    assert.equal(f.messages.filter(message => message.type === 'token').length, 2, 'changing back to high quality immediately reuses clean low video');
+    await f.advance(8000);
+    await f.env.fetch(mediaURL);
+    await flush();
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /high\.ts/);
+    assert.equal(f.messages.filter(message => message.type === 'token').length, 2);
+    assert.equal(f.messages.some(message => message.type === 'status' && message.state === 'waiting-ad'), false);
+    assert.equal(f.messages.some(message => message.type === 'reload'), false);
+    await f.dispose();
+});
+
+test('slow master setup cannot give variant probes a fresh eight-second search deadline', async () => {
+    const highURL = 'https://video.example.invalid/backup/high.m3u8';
+    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
+    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
+    const signals = [];
+    let releaseMaster;
+    const f = setup({ token: 'success', fetch: async (url, init) => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) return new Promise(resolve => { releaseMaster = resolve; });
+        if (url === highURL || url === lowURL) { signals.push(init.signal); return new Promise(() => {}); }
+        return new Response(ad);
+    } });
+    await f.env.fetch(masterURL);
+    const reading = f.env.fetch(mediaURL);
+    await flush();
+    await f.advance(7000);
+    releaseMaster(new Response(fallback));
+    await flush();
+    assert.equal(signals.length, 2);
+    await f.advance(999);
+    assert.equal(signals.every(signal => signal.aborted), false);
+    await f.advance(1);
+    assert.doesNotMatch(await (await reading).text(), /ad\.ts|EXTINF/);
+    assert.equal(signals.every(signal => signal.aborted), true);
+    assert.equal(f.engine.getDiagnostics().controllers, 0);
+    assert.equal(f.engine.getDiagnostics().pending, 0);
+    await f.dispose();
+});
+
+test('a stalled first profile cannot starve the other profiles on every recovery attempt', async () => {
+    let stalledSignal;
+    const f = setup({ token: 'success', fetch: async (url, init) => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) {
+            const playerType = f.messages.filter(message => message.type === 'token').at(-1).playerType;
+            if (playerType === 'embed') { stalledSignal = init.signal; return new Promise(() => {}); }
+            return new Response(master(backupURL));
+        }
+        return new Response(url === backupURL ? clean : ad);
+    } });
+    await f.env.fetch(masterURL);
+    const reading = f.env.fetch(mediaURL);
+    await flush();
+    await f.advance(8000);
+    assert.doesNotMatch(await (await reading).text(), /ad\.ts|EXTINF/);
+    assert.equal(stalledSignal.aborted, true);
+    await f.advance(2000);
+    assert.deepEqual(f.messages.filter(message => message.type === 'token').map(message => message.playerType), ['embed', 'popout']);
+    assert.ok(f.messages.some(message => message.type === 'reload'));
+    assert.equal(f.messages.filter(message => message.type === 'status').at(-1).state, 'playing');
+    await f.dispose();
+});
+
 test('simultaneous media requests share one bounded fallback search; caller cancellation settles', async () => {
     const f = setup({ token: 'hang' });
     await f.env.fetch(masterURL);
@@ -264,6 +659,61 @@ test('background recovery detects the end of an ad even when the player stops po
     assert.equal(f.engine.getDiagnostics().recoveryTimers, 0);
     assert.equal(f.messages.filter(message => message.type === 'status').at(-1).state, 'resuming');
     await f.dispose();
+});
+
+test('same-channel media replacement keeps recovery alive without another player request', async () => {
+    let content = ad;
+    const f = setup({ fetch: async url => new Response(url === masterURL ? master() : content) });
+    await f.env.fetch(masterURL);
+    assert.doesNotMatch(await (await f.env.fetch(mediaURL)).text(), /ad\.ts|EXTINF/);
+    assert.equal(f.engine.getDiagnostics().recoveryTimers, 1);
+    f.engine.setContext({ kind: 'live', id: 'channel', epoch: 2 });
+    f.engine.setContext({ kind: 'live', id: 'channel', epoch: 3 });
+    content = clean;
+    // Twitch stopped requesting playlists after receiving the empty waiting manifest.
+    await f.advance(1999);
+    assert.equal(f.messages.some(message => message.type === 'reload'), false);
+    await f.advance(1);
+    assert.deepEqual(f.messages.filter(message => message.type === 'reload').map(message => message.epoch), [3]);
+    assert.equal(f.messages.filter(message => message.type === 'status').at(-1).state, 'resuming');
+    assert.equal(f.engine.getDiagnostics().recoveryTimers, 0);
+    await f.dispose();
+});
+
+test('replacement during fallback aborts the old request and recovers only the current live context', async () => {
+    let content = ad;
+    const f = setup({ token: 'hang', fetch: async url => new Response(url === masterURL ? master() : content) });
+    await f.env.fetch(masterURL);
+    const oldReading = assert.rejects(f.env.fetch(mediaURL), { name: 'AbortError' });
+    await flush();
+    assert.equal(f.engine.getDiagnostics().pending, 1);
+    f.engine.setContext({ kind: 'live', id: 'channel', epoch: 2 });
+    await oldReading;
+    content = clean;
+    await f.advance(2000);
+    assert.deepEqual(f.messages.filter(message => message.type === 'reload').map(message => message.epoch), [2]);
+    assert.equal(f.engine.getDiagnostics().pending, 0);
+    assert.equal(f.engine.getDiagnostics().controllers, 0);
+    await f.dispose();
+});
+
+test('rearmed same-channel recovery is cancelled on navigation or shutdown', async () => {
+    for (const shutdown of [false, true]) {
+        const f = setup();
+        await f.env.fetch(masterURL);
+        await f.env.fetch(mediaURL);
+        f.engine.setContext({ kind: 'live', id: 'channel', epoch: 2 });
+        assert.equal(f.engine.getDiagnostics().recoveryTimers, 1);
+        if (shutdown) f.engine.stop();
+        else f.engine.setContext({ kind: 'live', id: 'other_channel', epoch: 3 });
+        const requests = f.calls.length;
+        await f.advance(60000);
+        assert.equal(f.calls.length, requests);
+        assert.equal(f.messages.some(message => message.type === 'reload'), false);
+        const diagnostics = f.engine.getDiagnostics();
+        for (const key of ['streams', 'media', 'pending', 'blockedSegments', 'controllers', 'recoveryTimers']) assert.equal(diagnostics[key], 0);
+        await f.dispose();
+    }
 });
 
 test('late TwitchNoSub response synthesis is inspected without double-wrapping successful responses', async () => {

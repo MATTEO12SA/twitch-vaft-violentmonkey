@@ -28,6 +28,7 @@ const output = `${metadata}
     if (window.top !== window.self || window.__VAFT_MATTEO_ACTIVE__) return;
     Object.defineProperty(window, '__VAFT_MATTEO_ACTIVE__', { value: true, configurable: true });
     const config = ${JSON.stringify(config, null, 4)};
+    Object.defineProperty(window, '__VAFT_MATTEO_VERSION__', { value: config.version, configurable: true });
 ${['network', 'hls', 'player', 'worker', 'runtime'].map(readSource).join('\n\n')}
     // Retain the Window receiver when timers are called through the injected environment.
     const runtime = createVaftRuntime({ window, document,

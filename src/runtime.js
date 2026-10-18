@@ -140,7 +140,7 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
             else if (message.type === 'cancel-token' && Number.isSafeInteger(message.id)) record.requests.get(message.id)?.abort();
             else if (message.type === 'status' && ['playing', 'searching', 'waiting-ad', 'resuming', 'error'].includes(message.state)) {
                 controller.setStatus({ state: message.state, hasAds: message.hasAds === true });
-            } else if (message.type === 'reload' && context.kind === 'live') controller.task({ reload: true });
+            } else if (message.type === 'reload' && context.kind === 'live') controller.task({ reload: true, adRecovery: true });
             else if (message.type === 'vod-ranges' && Array.isArray(message.ranges) && message.ranges.length <= 1000) {
                 controller.setVodRanges({ id: message.id, epoch: message.epoch, ranges: message.ranges, timelineReliable: message.timelineReliable === true });
             } else if (message.type === 'diagnostic') diagnostic(message.code);

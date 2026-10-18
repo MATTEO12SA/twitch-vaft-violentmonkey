@@ -2,15 +2,16 @@
 
 Userscript indépendant issu de [TwitchAdSolutions / vaft](https://github.com/pixeltris/TwitchAdSolutions), destiné à **Violentmonkey sur Chrome et Edge**, pour les directs de Twitch.
 
-## Version en préparation : 37.0.3
+## Version en préparation : 37.0.4
 
 Cette branche fiabilise les requêtes, les playlists et le cycle de vie du lecteur. **La validation en lecture réelle reste nécessaire avant fusion et distribution automatique.** Les tests automatisés utilisent des réponses simulées : ils ne démontrent pas que tous les formats publicitaires actuels de Twitch sont bloqués.
 
-Un essai complémentaire par injection temporaire dans un navigateur intégré a permis de corriger un plantage au démarrage. Il n'utilisait pas Violentmonkey et ne valide pas le blocage des publicités. Ses résultats et limites sont consignés dans [TESTING.md](TESTING.md).
+Un premier essai par injection temporaire a permis de corriger un plantage au démarrage. Des essais ultérieurs dans Edge, après installation signalée par l’utilisateur, ont observé les interceptions de VAFT et TwitchNoSub, une reprise du direct et la lecture d’une VOD publique. Ils ont aussi montré un blocage à approfondir après changement de qualité/navigation. Ces essais portent sur la candidate 37.0.3 ; ils ne valident pas encore 37.0.4. Résultats et limites dans [TESTING.md](TESTING.md).
 
 - Les opérations GraphQL explicitement destinées au direct sont les seules réécrites. Les opérations VOD et inconnues restent intactes, y compris dans un lot mixte.
-- Une publicité confirmée déclenche la recherche d’un flux alternatif. En l’absence de flux utilisable, VAFT renvoie une playlist d’attente sans segment publicitaire et affiche son état dans le lecteur.
-- Les requêtes auxiliaires sont annulées après 8 secondes, corps compris. La recherche complète est également bornée à 8 secondes. Les nouvelles recherches sont espacées de 2, 4, 8, 16 puis 30 secondes ; les relances du lecteur sont séparées d’au moins 8 secondes.
+- Une publicité confirmée déclenche la recherche d’un flux alternatif, y compris à basse résolution : priorité à une image sans publicité. Jusqu’à quatre variantes par profil sont sondées, deux à la fois ; les niveaux intermédiaires tournent entre les tentatives. Un secours lisible est conservé pendant la recherche d’une meilleure qualité, au plus toutes les 8 secondes et dans la limite du choix de l’utilisateur. Seuls des codecs compatibles sont substitués.
+- L’indication publicitaire se limite à « Pub bloquée ». Si aucune alternative propre n’est accessible, une playlist d’attente sans segment publicitaire est renvoyée. Le script ne peut pas garantir que Twitch fournit toujours un flux sans publicité.
+- Les requêtes auxiliaires sont annulées après 8 secondes, corps compris. La recherche complète est également bornée à 8 secondes ; chaque sonde de variante libère sa place après 2 secondes au maximum pour permettre l’essai d’autres qualités. L’ordre des profils tourne après échec. Les nouvelles recherches sont espacées de 2, 4, 8, 16 puis 30 secondes ; les relances du lecteur sont séparées d’au moins 8 secondes.
 - Les VOD restent inchangées par défaut. Le diagnostic VOD est activable en mode debug ; le saut de plages publicitaires confirmées est **expérimental et désactivé par défaut**.
 - Les interceptions de Workers conservent les autres wrappers, dont celui de TwitchNoSub. Des tests simulent les deux ordres d’installation ; la lecture réelle avec TwitchNoSub reste à valider.
 - Aucun remplacement global de la visibilité du document ou des méthodes de stockage. Aucun masquage générique de messages d’erreur, bannières, promotions ou fenêtres.
@@ -59,7 +60,7 @@ Aucune installation de dépendances npm n’est nécessaire. Après modification
 
 ## Diagnostic et limites
 
-Dans `src/config.js`, `debug: true` active des codes d’événement et compteurs limités, ainsi que `window.__VAFT_MATTEO_DEBUG__.snapshot()` et `.simulateAds(true/false)`. Ces commandes n’existent pas dans la distribution normale. La simulation ne prouve pas l’efficacité contre une publicité réelle.
+Dans `src/config.js`, `debug: true` active des codes d’événement et compteurs limités, ainsi que `window.__VAFT_MATTEO_DEBUG__.snapshot()` et `.simulateAds(true/false)`. Ces commandes n’existent pas dans la distribution normale. La simulation ne prouve pas l’efficacité contre une publicité réelle. `window.__VAFT_MATTEO_VERSION__` permet uniquement de lire le numéro de version chargé, sans activer le debug ni exposer de données de session.
 
 VAFT n’enregistre pas les en-têtes d’authentification, jetons, signatures ou URL signées. Les en-têtes utiles au relais restent en mémoire privée pendant la session. Ne pas joindre une capture réseau brute à un signalement : retirer cookies, jetons, signatures et identifiants de session. Indiquer plutôt navigateur, versions, scénario, code d’erreur visible et codes de diagnostic VAFT.
 
@@ -73,7 +74,7 @@ VAFT n’enregistre pas les en-têtes d’authentification, jetons, signatures o
 
 ## Publication et retour arrière
 
-La référence Git `baseline-37.0.2` conserve la version de départ. La version 37.0.3 est réservée à cette livraison et ne doit rejoindre `main` qu’après validation de [TESTING.md](TESTING.md). GitHub Actions vérifie la syntaxe, les métadonnées, le fichier généré et les tests sur Node 22 et 24.
+La référence Git `baseline-37.0.2` conserve la version de départ. La candidate 37.0.4 succède à 37.0.3 pour distinguer les nouvelles corrections dans les essais ; elle ne doit rejoindre `main` qu’après validation de [TESTING.md](TESTING.md). GitHub Actions vérifie la syntaxe, les métadonnées, le fichier généré et les tests sur Node 22 et 24.
 
 Pour annuler une version déjà distribuée, repartir du comportement validé, conserver le nom et le namespace et publier un numéro **supérieur** à la version retirée : un simple retour à un ancien numéro peut ne pas déclencher la mise à jour dans Violentmonkey.
 

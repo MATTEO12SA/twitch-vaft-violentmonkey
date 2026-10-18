@@ -239,6 +239,14 @@ test('own banner and unrelated chat mutations do not schedule discovery', () => 
     assert.equal(f.controller.getDiagnostics().metrics.scans, before);
     assert.equal(f.timers.size, 1);
     assert.equal(f.controller.getDiagnostics().verifiedOverlayRules, 0);
+    for (const state of ['searching', 'waiting-ad', 'playing', 'resuming']) {
+        f.controller.setStatus({ state, hasAds: true });
+        assert.equal(banner.textContent, 'Pub bloquée');
+    }
+    f.controller.setStatus({ state: 'error', hasAds: false });
+    assert.equal(banner.textContent, 'Récupération du lecteur indisponible.');
+    f.controller.setStatus({ state: 'unknown', hasAds: false });
+    assert.equal(banner.style.display, 'none');
 });
 
 test('BFCache suspend releases active resources and resume attaches exactly once', () => {
@@ -290,6 +298,183 @@ test('reload requires an unambiguous live React state and never reloads a VOD', 
     assert.equal(noReact.controller.task({ reload: true }), false);
 });
 
+test('React hydration on the same video recovers after a bounded negative-cache delay', () => {
+    const f = setup();
+    f.controller.start();
+    assert.equal(f.controller.task({ reload: true }), false);
+    const { player, state } = f.addReact();
+    for (let index = 0; index < 13; index++) {
+        f.advance(600);
+        assert.equal(f.controller.task({ reload: true }), false);
+    }
+    assert.equal(f.controller.getDiagnostics().metrics.reactScans, 1);
+    assert.equal(state.calls, 0);
+    f.advance(200);
+    assert.equal(f.controller.task({ reload: true }), true);
+    assert.equal(state.calls, 1);
+    assert.equal(f.controller.getPlayerAndState().video, f.video);
+    assert.equal(f.controller.getPlayerAndState().player, player);
+    assert.equal(f.controller.getDiagnostics().metrics.reactScans, 2);
+    f.advance(16000);
+    assert.equal(f.controller.getPlayerAndState().player, player);
+    assert.equal(f.controller.getDiagnostics().metrics.reactScans, 2, 'successful association stays cached');
+});
+
+test('negative-cache retries still refuse ambiguous React players', () => {
+    const f = setup();
+    f.controller.start();
+    assert.equal(f.controller.task({ reload: true }), false);
+    const { state } = f.addReact();
+    const fiber = f.root._reactRootContainer._internalRoot.current;
+    fiber.sibling = { stateNode: {
+        setPlayerActive() {},
+        props: { mediaPlayerInstance: { getHTMLVideoElement: () => f.video } }
+    } };
+    f.advance(8000);
+    assert.equal(f.controller.task({ reload: true }), false);
+    assert.equal(f.controller.getPlayerAndState().player, null);
+    assert.equal(state.calls, 0);
+    assert.equal(f.controller.getDiagnostics().metrics.reactScans, 2);
+    delete fiber.sibling;
+    f.advance(7999);
+    assert.equal(f.controller.task({ reload: true }), false);
+    assert.equal(f.controller.getDiagnostics().metrics.reactScans, 2);
+    f.advance(1);
+    assert.equal(f.controller.task({ reload: true }), true);
+    assert.equal(state.calls, 1);
+    assert.equal(f.controller.getDiagnostics().metrics.reactScans, 3);
+});
+
+test('confirmed ad recovery can reload an initially empty paused video without forcing play', () => {
+    const f = setup();
+    f.video.paused = true;
+    f.video.readyState = 0;
+    const { state } = f.addReact();
+    f.controller.start();
+    assert.equal(f.controller.task({ reload: true }), false, 'ordinary reload retains the pause gate');
+    assert.equal(f.controller.task({ pausePlay: true, adRecovery: true }), false, 'never force pause/play during startup');
+    assert.equal(f.controller.task({ reload: true, adRecovery: true }), true);
+    assert.equal(state.calls, 1);
+    assert.equal(f.video.playCalls, 0);
+    assert.equal(f.controller.task({ reload: true, adRecovery: true }), false, 'reload cooldown still applies');
+    // The player starts naturally after setSrc. Its initial HAVE_NOTHING state
+    // must not become a pause to restore when metadata arrives.
+    f.video.paused = false;
+    f.video.readyState = 1;
+    f.video.emit('loadedmetadata');
+    assert.equal(f.video.paused, false);
+    assert.equal(f.video.pauseCalls, 0);
+    assert.equal(f.video.playCalls, 0);
+});
+
+test('ad recovery preserves loaded, uncertain, and explicitly observed pauses', () => {
+    for (const readyState of [1, undefined]) {
+        const f = setup();
+        f.video.paused = true;
+        f.video.readyState = readyState;
+        const { state } = f.addReact();
+        f.controller.start();
+        assert.equal(f.controller.task({ reload: true, adRecovery: true }), false);
+        assert.equal(state.calls, 0);
+        assert.equal(f.video.playCalls, 0);
+    }
+    const waiting = setup();
+    waiting.video.paused = true;
+    waiting.video.readyState = 0;
+    const { state } = waiting.addReact();
+    waiting.controller.start();
+    waiting.video.emit('pause');
+    assert.equal(waiting.controller.task({ reload: true, adRecovery: true }), false);
+    assert.equal(state.calls, 0);
+    assert.equal(waiting.video.playCalls, 0);
+});
+
+test('an emptied video that already loaded media is not treated as initial buffering', () => {
+    const f = setup();
+    f.video.paused = true;
+    f.video.readyState = 0;
+    const { state } = f.addReact();
+    f.controller.start();
+    f.video.readyState = 1;
+    f.video.emit('loadedmetadata');
+    f.video.readyState = 0;
+    f.video.emit('emptied');
+    assert.equal(f.controller.task({ reload: true, adRecovery: true }), false);
+    assert.equal(state.calls, 0);
+    assert.equal(f.video.playCalls, 0);
+});
+
+test('a user pause during initial ad recovery survives replacement media', () => {
+    const f = setup();
+    f.video.paused = true;
+    f.video.readyState = 0;
+    const { state } = f.addReact();
+    f.controller.start();
+    assert.equal(f.controller.task({ reload: true, adRecovery: true }), true);
+    f.video.paused = false;
+    f.video.pause();
+    const replacement = new Video();
+    f.video.remove();
+    f.playerContainer.appendChild(replacement);
+    f.mutate([replacement], [f.video]);
+    f.advance(150);
+    assert.equal(state.calls, 1);
+    assert.equal(replacement.paused, true);
+    assert.equal(replacement.playCalls, 0);
+});
+
+test('a same-route replacement keeps an observed pause even without reload restore state', () => {
+    for (const delayedReplacement of [false, true]) {
+        const f = setup();
+        f.video.readyState = 4;
+        f.video.currentTime = 10;
+        const { player, state } = f.addReact();
+        f.controller.start();
+        f.video.pause();
+        const replacement = new Video();
+        replacement.paused = true;
+        replacement.readyState = 0;
+        f.video.remove();
+        if (delayedReplacement) {
+            f.mutate([], [f.video]);
+            f.advance(150);
+        }
+        f.playerContainer.appendChild(replacement);
+        player.getHTMLVideoElement = () => replacement;
+        f.mutate([replacement], delayedReplacement ? [] : [f.video]);
+        f.advance(150);
+        assert.equal(f.controller.task({ reload: true, adRecovery: true }), false);
+        assert.equal(state.calls, 0);
+        assert.equal(replacement.playCalls, 0);
+        // An explicit subsequent play clears the retained pause intent.
+        replacement.play();
+        assert.equal(f.controller.task({ reload: true, adRecovery: true }), true);
+        assert.equal(state.calls, 1);
+    }
+});
+
+test('a new channel with new media does not inherit the previous channel pause', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    f.video.currentTime = 10;
+    const { player, state } = f.addReact();
+    f.controller.start();
+    f.video.pause();
+    const replacement = new Video();
+    replacement.paused = true;
+    replacement.readyState = 0;
+    f.video.remove();
+    f.playerContainer.appendChild(replacement);
+    player.getHTMLVideoElement = () => replacement;
+    f.win.location.href = 'https://www.twitch.tv/other_channel';
+    f.mutate([replacement], [f.video]);
+    f.advance(150);
+    assert.equal(f.controller.getContext().id, 'other_channel');
+    assert.equal(f.controller.task({ reload: true, adRecovery: true }), true);
+    assert.equal(state.calls, 1);
+    assert.equal(replacement.playCalls, 0);
+});
+
 test('reload restores sound settings on replacement media without forcing playback', () => {
     const f = setup();
     f.addReact();
@@ -312,6 +497,38 @@ test('an intentional pause after reload remains paused after media replacement',
     f.addReact();
     f.controller.start();
     f.controller.task({ reload: true });
+    f.video.pause();
+    const replacement = new Video();
+    f.video.remove();
+    f.playerContainer.appendChild(replacement);
+    f.mutate([replacement], [f.video]);
+    f.advance(150);
+    assert.equal(replacement.paused, true);
+    assert.equal(replacement.playCalls, 0);
+});
+
+test('a later play supersedes a pending pause restore before metadata arrives', () => {
+    const f = setup();
+    f.addReact();
+    f.controller.start();
+    assert.equal(f.controller.task({ reload: true }), true);
+    f.video.pause();
+    f.video.play();
+    f.video.emit('loadedmetadata');
+    assert.equal(f.video.paused, false);
+    assert.equal(f.video.pauseCalls, 1, 'restoration must not replay an outdated pause');
+    assert.equal(f.video.playCalls, 1, 'only the explicit play is issued');
+    f.video.emit('loadedmetadata');
+    assert.equal(f.video.pauseCalls, 1, 'the restore is consumed once');
+});
+
+test('a new pause after play stays authoritative during a pending reload', () => {
+    const f = setup();
+    f.addReact();
+    f.controller.start();
+    assert.equal(f.controller.task({ reload: true }), true);
+    f.video.pause();
+    f.video.play();
     f.video.pause();
     const replacement = new Video();
     f.video.remove();

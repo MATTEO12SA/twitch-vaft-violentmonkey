@@ -66,6 +66,7 @@ test('complete generated bundle initializes at document-start and disposes on pa
         MutationObserver: class { observe() {} disconnect() {} } };
     vm.runInNewContext(source, sandbox);
     assert.equal(win.__VAFT_MATTEO_ACTIVE__, true);
+    assert.equal(win.__VAFT_MATTEO_VERSION__, config.version);
     assert.equal(win.__VAFT_MATTEO_DEBUG__, undefined);
     assert.notEqual(win.fetch, originalFetch);
     assert.equal(timers.size, 1);

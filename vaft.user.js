@@ -1791,7 +1791,10 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
 
     return { start, stop, getDiagnostics };
 }
-    const runtime = createVaftRuntime({ window, document, setTimeout, clearTimeout, MutationObserver }, config,
+    // Retain the Window receiver when timers are called through the injected environment.
+    const runtime = createVaftRuntime({ window, document,
+        setTimeout: window.setTimeout.bind(window), clearTimeout: window.clearTimeout.bind(window),
+        MutationObserver }, config,
         createNetworkTools, createHlsTools, createPlayerController, createWorkerEngine, workerBootstrap);
     runtime.start();
 })();

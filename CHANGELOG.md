@@ -9,6 +9,7 @@
 - Recherche d’alternatives et attente sans renvoi volontaire des segments publicitaires confirmés ; récupération bornée et espacée.
 - Préservation des wrappers de Workers, isolation des contextes, nettoyage des ressources et diagnostic des formats non instrumentés.
 - Cycle de vie du lecteur avec observation ciblée, surveillance adaptative et conservation des réglages, sans anciens hooks globaux de visibilité/stockage.
+- Timers du lecteur liés à `window` pour éviter l'erreur de démarrage `Illegal invocation` reproduite dans un navigateur ; test de distribution renforcé.
 - VOD inchangées par défaut ; diagnostic et saut expérimental de plages confirmées opt-in, non validés sur publicité réelle.
 - Tests Node, fixtures synthétiques, contrôles GitHub Actions et procédure manuelle préalable à publication.
 

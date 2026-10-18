@@ -49,8 +49,16 @@ test('complete generated bundle initializes at document-start and disposes on pa
     Object.assign(win, { URL, Request, Response, Headers, Blob, AbortController, DOMException, TextDecoder,
         fetch: originalFetch, Worker: class Worker {}, console,
         location: { href: 'https://www.twitch.tv/channel' },
-        setTimeout(callback) { timers.add(callback); return callback; },
-        clearTimeout(callback) { timers.delete(callback); }
+        // Chromium timers require a Window receiver; Node's timers do not.
+        setTimeout(callback) {
+            assert.equal(this, win, 'setTimeout must retain its Window receiver');
+            timers.add(callback);
+            return callback;
+        },
+        clearTimeout(callback) {
+            assert.equal(this, win, 'clearTimeout must retain its Window receiver');
+            timers.delete(callback);
+        }
     });
     win.self = win.top = win;
     const doc = { documentElement: {}, querySelector: () => null, querySelectorAll: () => [] };

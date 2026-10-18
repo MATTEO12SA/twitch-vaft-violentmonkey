@@ -1,6 +1,6 @@
 # Validation de 37.0.3
 
-Les cases cochées ci-dessous concernent exclusivement les tests automatisés exécutés dans Node. Les essais Chrome/Edge et Twitch réels n’ont pas été effectués dans cet environnement. Ne pas les considérer acquis à partir de tests simulés.
+Les cases cochées de la section Automatisation concernent exclusivement les tests exécutés dans Node. Les essais Chrome/Edge **avec installation dans Violentmonkey** restent à effectuer. Des essais complémentaires par injection temporaire dans un navigateur intégré sont décrits séparément ci-dessous ; ils ne remplacent pas cette validation.
 
 ## Automatisation
 
@@ -24,6 +24,25 @@ Exécuter `npm run build`, puis `npm run check`. Aucune dépendance à installer
 - [x] Relais Worker limité à l’opération prévue, identifiants dupliqués et messages étrangers ignorés.
 
 Les tests VM utilisent un environnement navigateur simulé. Ils ne testent pas les politiques CSP/CORS réelles ni le décodage média matériel.
+
+## Essai complémentaire dans le navigateur intégré
+
+Compte rendu établi le 18 octobre 2026, pour les observations de la session du 17 octobre. Le navigateur intégré sous Windows annonçait `Chrome/155.0.0.0` dans son user-agent : il ne s'agit pas d'un essai dans les applications Chrome ou Edge avec leur profil d'extensions.
+
+Le fichier généré `vaft.user.js` et le code du userscript TwitchNoSub 1.2.1 ont été exécutés temporairement dans le contexte de la page via les outils de développement. **Violentmonkey n'a pas été utilisé pour ces essais.** Aucun script n'a été enregistré dans un gestionnaire. L'injection avait lieu après le chargement de la page, avant les navigations SPA examinées ; les chargements complets suivants supprimaient ces injections. Le chargement à `document-start` n'est donc pas validé par cet essai.
+
+| Vérification | Observation | Portée |
+| --- | --- | --- |
+| Démarrage du bundle de la PR au commit `0bef292` | Échec `TypeError: Illegal invocation` dans `scheduleTick` | Défaut réel : les timers natifs étaient appelés avec l'objet d'environnement comme receiver |
+| Démarrage après liaison des deux timers à `window` | Exécution sans exception ; interceptions actives | Correction reproduite dans le même navigateur ; test Node renforcé, rouge avant correction puis vert |
+| Direct Locklear vers ow_esports par navigation SPA avec VAFT | Lecture observée à 1280 × 720, `readyState=4`, aucune erreur média | Fonctionnement ordinaire ; aucun cycle publicitaire confirmé |
+| Pause manuelle puis reprise du direct | Pause conservée jusqu'à l'action manuelle ; lecture reprise ensuite | Contrôle de lecture élémentaire, pas une récupération après publicité |
+| VAFT puis TwitchNoSub, et ordre inverse | Un vrai Worker Blob de test répond au ping et émet le message `ready` de VAFT dans les deux ordres, malgré révocation immédiate de l'URL d'entrée | Amorçage et chaîne de constructeurs dans un navigateur réel ; charge utile du Worker synthétique, pas validation complète du lecteur Twitch |
+| Direct avec les deux codes injectés | Lecture observée sans erreur média | Coexistence élémentaire après navigation SPA |
+| VOD publique ow_esports `2898046132`, sans injections | Lecture normale, durée observée 30 460,753 s | Référence de comparaison seulement |
+| VOD vers direct avec TwitchNoSub puis VAFT injectés | Direct en progression, `readyState=4`, aucune erreur média | Sens VOD vers direct observé ; retour VOD, déplacement et qualité non validés dans cet essai |
+
+Le test n'établit ni l'installation/mise à jour Violentmonkey, ni l'efficacité publicitaire, ni la compatibilité complète des VOD avec TwitchNoSub. Les pre-roll/mid-roll, l'attente suivie d'une reprise, HEVC, la session d'une heure et le budget de performance restent à valider. Aucune case Chrome/Edge ci-dessous n'est cochée sur la base de cet essai. La PR reste en brouillon.
 
 ## Validation manuelle avant fusion
 

@@ -6,6 +6,8 @@ Userscript indépendant issu de [TwitchAdSolutions / vaft](https://github.com/pi
 
 Cette branche fiabilise les requêtes, les playlists et le cycle de vie du lecteur. **La validation en lecture réelle reste nécessaire avant fusion et distribution automatique.** Les tests automatisés utilisent des réponses simulées : ils ne démontrent pas que tous les formats publicitaires actuels de Twitch sont bloqués.
 
+Un essai complémentaire par injection temporaire dans un navigateur intégré a permis de corriger un plantage au démarrage. Il n'utilisait pas Violentmonkey et ne valide pas le blocage des publicités. Ses résultats et limites sont consignés dans [TESTING.md](TESTING.md).
+
 - Les opérations GraphQL explicitement destinées au direct sont les seules réécrites. Les opérations VOD et inconnues restent intactes, y compris dans un lot mixte.
 - Une publicité confirmée déclenche la recherche d’un flux alternatif. En l’absence de flux utilisable, VAFT renvoie une playlist d’attente sans segment publicitaire et affiche son état dans le lecteur.
 - Les requêtes auxiliaires sont annulées après 8 secondes, corps compris. La recherche complète est également bornée à 8 secondes. Les nouvelles recherches sont espacées de 2, 4, 8, 16 puis 30 secondes ; les relances du lecteur sont séparées d’au moins 8 secondes.

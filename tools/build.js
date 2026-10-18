@@ -29,7 +29,10 @@ const output = `${metadata}
     Object.defineProperty(window, '__VAFT_MATTEO_ACTIVE__', { value: true, configurable: true });
     const config = ${JSON.stringify(config, null, 4)};
 ${['network', 'hls', 'player', 'worker', 'runtime'].map(readSource).join('\n\n')}
-    const runtime = createVaftRuntime({ window, document, setTimeout, clearTimeout, MutationObserver }, config,
+    // Retain the Window receiver when timers are called through the injected environment.
+    const runtime = createVaftRuntime({ window, document,
+        setTimeout: window.setTimeout.bind(window), clearTimeout: window.clearTimeout.bind(window),
+        MutationObserver }, config,
         createNetworkTools, createHlsTools, createPlayerController, createWorkerEngine, workerBootstrap);
     runtime.start();
 })();

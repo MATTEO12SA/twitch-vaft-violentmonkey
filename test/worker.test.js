@@ -180,7 +180,7 @@ test('clean low-resolution fallback is preferred to waiting and reused on later 
     assert.match(await (await f.env.fetch(mediaURL)).text(), /backup\/normal\.ts/);
     assert.equal(f.messages.filter(message => message.type === 'token').length, 1, 'reuse the clean lower quality without a new token search');
     assert.equal(f.calls.filter(call => call.url === lowURL).length, 2);
-    assert.equal(f.engine.getDiagnostics().recoveryTimers, 0);
+    assert.equal(f.engine.getDiagnostics().recoveryTimers, 1);
     await f.dispose();
 });
 
@@ -230,32 +230,26 @@ test('stalled highest and lowest probes release their slots for a clean intermed
     await f.dispose();
 });
 
-test('an AVC refresh cannot reuse the result of a concurrent AV1 fallback search', async () => {
+test('a stray AV1 request cannot discard or consume a working AVC fallback', async () => {
     const av1Live = 'https://video.example.invalid/live/av1.m3u8';
     const avcBackup = 'https://video.example.invalid/backup/avc.m3u8';
     const av1Backup = 'https://video.example.invalid/backup/av1.m3u8';
     const original = master() + master(av1Live, 'av01.0.08M.08').replace('#EXTM3U\n', '');
     const fallback = master(avcBackup) + master(av1Backup, 'av01.0.08M.08').replace('#EXTM3U\n', '');
-    let releaseAV1;
     const f = setup({ token: 'success', fetch: async url => {
         if (url === masterURL) return new Response(original);
         if (url.includes('usher')) return new Response(fallback);
         if (url === avcBackup) return new Response(clean.replace('normal.ts', 'avc.ts'));
-        if (url === av1Backup) return new Promise(resolve => { releaseAV1 = resolve; });
         return new Response(ad);
     } });
     await f.env.fetch(masterURL);
     assert.match(await (await f.env.fetch(mediaURL)).text(), /avc\.ts/);
     await f.advance(501);
-    const av1Reading = f.env.fetch(av1Live);
-    await flush();
-    const avcReading = f.env.fetch(mediaURL);
-    await flush();
-    releaseAV1(new Response(clean.replace('normal.ts', 'av1.ts')));
-    assert.match(await (await av1Reading).text(), /av1\.ts/);
-    const avcText = await (await avcReading).text();
-    assert.match(avcText, /avc\.ts/);
-    assert.doesNotMatch(avcText, /av1\.ts|ad\.ts/);
+    const [av1Response, avcResponse] = await Promise.all([f.env.fetch(av1Live), f.env.fetch(mediaURL)]);
+    assert.doesNotMatch(await av1Response.text(), /avc\.ts|av1\.ts|ad\.ts/);
+    assert.match(await avcResponse.text(), /avc\.ts/);
+    assert.equal(f.calls.some(call => call.url === av1Backup), false, 'the working cache is not replaced by another codec');
+    assert.equal(f.messages.filter(message => message.type === 'status').at(-1).state, 'playing');
     await f.dispose();
 });
 
@@ -308,200 +302,135 @@ test('fallback never exceeds the requested resolution or substitutes another cod
     await f.dispose();
 });
 
-test('background quality improvement keeps low video playing, bounds slow probes, and promotes a clean higher variant', async () => {
+test('a usable low fallback remains frozen even after higher qualities become clean', async () => {
     const highURL = 'https://video.example.invalid/backup/high.m3u8';
     const lowURL = 'https://video.example.invalid/backup/low.m3u8';
     const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
-    let mode = 'ad';
-    let highSignal;
-    const f = setup({ token: 'success', fetch: async (url, init) => {
+    let highIsClean = false;
+    const f = setup({ token: 'success', fetch: async url => {
         if (url === masterURL) return new Response(master());
         if (url.includes('usher')) return new Response(fallback);
-        if (url === highURL) {
-            if (mode === 'hang') { highSignal = init.signal; return new Promise(() => {}); }
-            return new Response(mode === 'clean' ? clean.replace('normal.ts', 'high.ts') : ad);
-        }
+        if (url === highURL) return new Response(highIsClean ? clean.replace('normal.ts', 'high.ts') : ad);
         return new Response(url === lowURL ? clean.replace('normal.ts', 'low.ts') : ad);
     } });
     await f.env.fetch(masterURL);
     assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-    mode = 'hang';
-    await f.advance(7999);
+    highIsClean = true;
+    await f.advance(32000);
     assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-    assert.equal(f.calls.filter(call => call.url === highURL).length, 1);
-    await f.advance(1);
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-    assert.equal(f.calls.filter(call => call.url === highURL).length, 2);
-    await f.advance(1000);
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-    assert.equal(f.calls.filter(call => call.url === highURL).length, 2);
-    await f.advance(7000);
-    assert.equal(highSignal.aborted, true);
-    assert.equal(f.engine.getDiagnostics().controllers, 0);
-    mode = 'clean';
-    await f.env.fetch(mediaURL);
-    await flush();
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /high\.ts/);
+    assert.equal(f.calls.filter(call => call.url === highURL).length, 1, 'no background promotion probe while the fallback works');
     assert.equal(f.messages.filter(message => message.type === 'token').length, 1);
-    assert.equal(f.engine.getDiagnostics().controllers, 0);
+    assert.equal(f.messages.some(message => message.type === 'reload'), false);
+    assert.equal(f.engine.getDiagnostics().recoveryTimers, 1, 'the pinned original is still monitored');
     await f.dispose();
 });
 
-test('late quality probes cannot promote across a media epoch or the end of an ad', async () => {
+test('late fallback refresh cannot overwrite a replacement context or a confirmed ad end', async () => {
     for (const boundary of ['replacement', 'ad-end']) {
-        const highURL = 'https://video.example.invalid/backup/high.m3u8';
-        const lowURL = 'https://video.example.invalid/backup/low.m3u8';
-        const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
-        let content = ad;
-        let deferHigh = false;
-        let releaseHigh;
-        let highSignal;
+        let original = ad;
+        let deferBackup = false;
+        let releaseBackup;
+        let backupSignal;
         const f = setup({ token: 'success', fetch: async (url, init) => {
             if (url === masterURL) return new Response(master());
-            if (url.includes('usher')) return new Response(fallback);
-            if (url === highURL && deferHigh) {
-                highSignal = init.signal;
-                return new Promise(resolve => { releaseHigh = resolve; });
+            if (url.includes('usher')) return new Response(master(backupURL));
+            if (url === backupURL && deferBackup) {
+                backupSignal = init.signal;
+                return new Promise(resolve => { releaseBackup = resolve; });
             }
-            return new Response(url === lowURL ? clean.replace('normal.ts', 'low.ts') : url === mediaURL ? content : ad);
+            return new Response(url === backupURL ? clean : original);
         } });
         await f.env.fetch(masterURL);
-        assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-        deferHigh = true;
-        await f.advance(8000);
-        assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-        assert.equal(typeof releaseHigh, 'function');
+        await f.env.fetch(mediaURL);
+        await f.advance(501);
+        deferBackup = true;
+        const stale = assert.rejects(f.env.fetch(mediaURL), { name: 'AbortError' });
+        await flush();
+        assert.equal(typeof releaseBackup, 'function');
         if (boundary === 'replacement') f.engine.setContext({ kind: 'live', id: 'channel', epoch: 2 });
         else {
-            content = clean;
+            original = clean;
             assert.equal(await (await f.env.fetch(mediaURL)).text(), clean);
         }
-        assert.equal(highSignal.aborted, true);
-        releaseHigh(new Response(clean.replace('normal.ts', 'stale-high.ts')));
+        await stale;
+        // A completed-ad generation invalidates the result even if the refresh
+        // itself was not the search controller; replacement aborts every request.
+        if (boundary === 'replacement') assert.equal(backupSignal.aborted, true);
+        releaseBackup(new Response(ad));
+        deferBackup = false;
         await flush();
-        deferHigh = false;
-        content = ad;
-        assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-        assert.equal(f.engine.getDiagnostics().controllers, 0);
+        if (boundary === 'replacement') assert.match(await (await f.env.fetch(mediaURL)).text(), /normal\.ts/);
+        else assert.equal(f.messages.filter(message => message.type === 'status').at(-1).adEnded, true);
         await f.dispose();
     }
 });
 
-test('a clean promotion survives a concurrent stale lower-quality refresh failure', async () => {
+test('a failed frozen fallback is replaced with a newly verified clean candidate', async () => {
     const highURL = 'https://video.example.invalid/backup/high.m3u8';
     const lowURL = 'https://video.example.invalid/backup/low.m3u8';
     const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
-    let upgrade = false;
-    let releaseLow;
+    let replace = false;
     const f = setup({ token: 'success', fetch: async url => {
         if (url === masterURL) return new Response(master());
         if (url.includes('usher')) return new Response(fallback);
-        if (url === highURL) return new Response(upgrade ? clean.replace('normal.ts', 'high.ts') : ad);
-        if (url === lowURL && upgrade) return new Promise(resolve => { releaseLow = resolve; });
-        return new Response(url === lowURL ? clean.replace('normal.ts', 'low.ts') : ad);
-    } });
-    await f.env.fetch(masterURL);
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-    upgrade = true;
-    await f.advance(8000);
-    const reading = f.env.fetch(mediaURL);
-    await flush();
-    assert.equal(typeof releaseLow, 'function');
-    releaseLow(new Response(ad));
-    assert.match(await (await reading).text(), /high\.ts/);
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /high\.ts/);
-    assert.equal(f.messages.filter(message => message.type === 'token').length, 1);
-    await f.dispose();
-});
-
-test('an obsolete quality probe is cancelled when its clean backup is replaced', async () => {
-    const highURL = 'https://video.example.invalid/backup/high.m3u8';
-    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
-    const replacementURL = 'https://video.example.invalid/replacement/index.m3u8';
-    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
-    let phase = 'initial';
-    let releaseHigh;
-    let highSignal;
-    const f = setup({ token: 'success', fetch: async (url, init) => {
-        if (url === masterURL) return new Response(master());
-        if (url.includes('usher')) return new Response(phase === 'replace' ? master(replacementURL).replace('1920x1080', '640x360') : fallback);
-        if (url === highURL && phase !== 'initial') {
-            highSignal = init.signal;
-            return new Promise(resolve => { releaseHigh = resolve; });
-        }
-        if (url === replacementURL) return new Response(clean.replace('normal.ts', 'replacement.ts'));
-        if (url === lowURL && phase !== 'replace') return new Response(clean.replace('normal.ts', 'low.ts'));
+        if (url === highURL && replace) return new Response(clean.replace('normal.ts', 'replacement.ts'));
+        if (url === lowURL && !replace) return new Response(clean.replace('normal.ts', 'low.ts'));
         return new Response(ad);
     } });
     await f.env.fetch(masterURL);
     assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-    phase = 'upgrade';
-    await f.advance(8000);
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-    phase = 'replace';
+    replace = true;
     await f.advance(501);
     assert.match(await (await f.env.fetch(mediaURL)).text(), /replacement\.ts/);
-    assert.equal(highSignal.aborted, true);
-    releaseHigh(new Response(clean.replace('normal.ts', 'obsolete-high.ts')));
-    await flush();
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /replacement\.ts/);
+    assert.equal(f.messages.filter(message => message.type === 'token').length, 2);
+    assert.equal(f.messages.some(message => message.adEnded), false);
     await f.dispose();
 });
 
-test('an in-flight upgrade cannot override a later lower resolution selection', async () => {
+test('the original recovery target and session survive lower-quality requests and same-channel replacement', async () => {
     const selectedLowURL = 'https://video.example.invalid/live/360.m3u8';
-    const highURL = 'https://video.example.invalid/backup/high.m3u8';
-    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
     const original = master() + master(selectedLowURL).replace('#EXTM3U\n', '').replace('1920x1080', '640x360');
-    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
-    let deferHigh = false;
-    let releaseHigh;
+    let originalContent = ad;
     const f = setup({ token: 'success', fetch: async url => {
         if (url === masterURL) return new Response(original);
-        if (url.includes('usher')) return new Response(fallback);
-        if (url === highURL && deferHigh) return new Promise(resolve => { releaseHigh = resolve; });
-        return new Response(url === lowURL ? clean.replace('normal.ts', 'low.ts') : ad);
+        if (url.includes('usher')) return new Response(master(backupURL));
+        return new Response(url === mediaURL ? originalContent : clean);
     } });
     await f.env.fetch(masterURL);
-    await f.env.fetch(mediaURL);
-    deferHigh = true;
-    await f.advance(8000);
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-    assert.match(await (await f.env.fetch(selectedLowURL)).text(), /low\.ts/);
-    releaseHigh(new Response(clean.replace('normal.ts', 'excess-high.ts')));
-    await flush();
-    assert.match(await (await f.env.fetch(selectedLowURL)).text(), /low\.ts/);
-    assert.equal(f.messages.filter(message => message.type === 'token').length, 1, 'the compatible low cache was retained');
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /backup\/normal\.ts/);
+    const session = f.messages.find(message => message.hasAds).adSession;
+    assert.match(await (await f.env.fetch(selectedLowURL)).text(), /backup\/normal\.ts/);
+    assert.equal(f.messages.some(message => message.adEnded), false, 'another clean quality is not the pinned recovery target');
+    f.engine.setContext({ kind: 'live', id: 'channel', epoch: 2 });
+    const retained = f.messages.filter(message => message.type === 'status').at(-1);
+    assert.equal(retained.hasAds, true);
+    assert.equal(retained.adSession, session);
+    assert.equal(retained.channel, 'channel');
+    assert.equal(retained.epoch, 2);
+    originalContent = clean;
+    await f.advance(2000);
+    const ended = f.messages.find(message => message.adEnded && message.type === 'status');
+    assert.equal(ended.adSession, session);
+    assert.equal(ended.clean, true);
+    assert.equal(ended.epoch, 2);
+    assert.equal(f.messages.filter(message => message.type === 'reload').length, 1);
     await f.dispose();
 });
 
-test('manual high-to-low-to-high selection keeps clean compatible video and later restores higher quality', async () => {
+test('high-to-low-to-high requests keep the same usable fallback throughout the block', async () => {
     const selectedLowURL = 'https://video.example.invalid/live/360.m3u8';
-    const highURL = 'https://video.example.invalid/backup/high.m3u8';
-    const lowURL = 'https://video.example.invalid/backup/low.m3u8';
     const original = master() + master(selectedLowURL).replace('#EXTM3U\n', '').replace('1920x1080', '640x360');
-    const fallback = master(highURL) + master(lowURL).replace('#EXTM3U\n', '').replace('1920x1080', '284x160');
-    let lowIsClean = false;
     const f = setup({ token: 'success', fetch: async url => {
         if (url === masterURL) return new Response(original);
-        if (url.includes('usher')) return new Response(fallback);
-        if (url === highURL) return new Response(clean.replace('normal.ts', 'high.ts'));
-        if (url === lowURL && lowIsClean) return new Response(clean.replace('normal.ts', 'low.ts'));
-        return new Response(ad);
+        if (url.includes('usher')) return new Response(master(backupURL));
+        return new Response(url === backupURL ? clean.replace('normal.ts', 'frozen1080.ts') : ad);
     } });
     await f.env.fetch(masterURL);
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /high\.ts/);
-    lowIsClean = true;
-    assert.match(await (await f.env.fetch(selectedLowURL)).text(), /low\.ts/);
-    assert.equal(f.messages.filter(message => message.type === 'token').length, 2);
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /low\.ts/);
-    assert.equal(f.messages.filter(message => message.type === 'token').length, 2, 'changing back to high quality immediately reuses clean low video');
-    await f.advance(8000);
-    await f.env.fetch(mediaURL);
-    await flush();
-    assert.match(await (await f.env.fetch(mediaURL)).text(), /high\.ts/);
-    assert.equal(f.messages.filter(message => message.type === 'token').length, 2);
-    assert.equal(f.messages.some(message => message.type === 'status' && message.state === 'waiting-ad'), false);
+    for (const url of [mediaURL, selectedLowURL, mediaURL, selectedLowURL]) {
+        assert.match(await (await f.env.fetch(url)).text(), /frozen1080\.ts/);
+        await f.advance(501);
+    }
+    assert.equal(f.messages.filter(message => message.type === 'token').length, 1);
     assert.equal(f.messages.some(message => message.type === 'reload'), false);
     await f.dispose();
 });
@@ -633,7 +562,7 @@ test('an old ad request cannot overwrite a clean parallel response with a stale 
     content = clean;
     assert.equal(await (await f.env.fetch(mediaURL)).text(), clean);
     await stale;
-    assert.equal(f.messages.filter(message => message.type === 'status').at(-1).state, 'playing');
+    assert.equal(f.messages.filter(message => message.type === 'status').at(-1).state, 'resuming');
     assert.equal(f.engine.getDiagnostics().recoveryTimers, 0);
     await f.dispose();
 });
@@ -743,5 +672,150 @@ test('long synthetic session keeps owned maps bounded across twenty channels', a
         assert.ok(f.engine.getDiagnostics().blockedSegments <= 1);
         await f.advance(180000);
     }
+    await f.dispose();
+});
+
+
+test('an empty pinned playlist cannot end the block or release a usable fallback', async () => {
+    let original = ad;
+    const f = setup({ token: 'success', fetch: async url => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) return new Response(master(backupURL));
+        return new Response(url === backupURL ? clean : original);
+    } });
+    await f.env.fetch(masterURL);
+    await f.env.fetch(mediaURL);
+    original = '#EXTM3U\n#EXT-X-TARGETDURATION:2\n';
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /backup\/normal\.ts/);
+    await f.advance(2000);
+    assert.equal(f.messages.some(message => message.adEnded), false);
+    assert.equal(f.engine.getDiagnostics().recoveryTimers, 1);
+    original = clean;
+    await f.advance(2000);
+    assert.equal(f.messages.filter(message => message.type === 'status' && message.adEnded).length, 1);
+    assert.equal(f.messages.filter(message => message.type === 'reload').length, 1);
+    await f.dispose();
+});
+
+test('a clean response requested before the ad started cannot release its quality lock', async () => {
+    let deferOriginal = true;
+    let releaseOriginal;
+    let original = ad;
+    const f = setup({ token: 'success', fetch: async url => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) return new Response(master(backupURL));
+        if (url === mediaURL && deferOriginal) return new Promise(resolve => { releaseOriginal = resolve; });
+        return new Response(url === backupURL ? clean.replace('normal.ts', 'fallback.ts') : original);
+    } });
+    await f.env.fetch(masterURL);
+    const oldClean = f.env.fetch(mediaURL);
+    deferOriginal = false;
+    assert.match(await (await f.env.fetch(mediaURL)).text(), /fallback\.ts/);
+    releaseOriginal(new Response(clean.replace('normal.ts', 'stale-original.ts')));
+    assert.match(await (await oldClean).text(), /fallback\.ts/);
+    assert.equal(f.messages.some(message => message.adEnded), false);
+    original = clean;
+    await f.env.fetch(mediaURL);
+    assert.equal(f.messages.filter(message => message.type === 'status' && message.adEnded).length, 1);
+    await f.dispose();
+});
+
+test('a late old ad response cannot start a new block after a fresh confirmed end', async () => {
+    let deferred;
+    let count = 0;
+    let original = ad;
+    const f = setup({ token: 'success', fetch: async url => {
+        if (url === masterURL) return new Response(master());
+        if (url.includes('usher')) return new Response(master(backupURL));
+        if (url === mediaURL && ++count === 1) return new Promise(resolve => { deferred = resolve; });
+        return new Response(url === backupURL ? clean : original);
+    } });
+    await f.env.fetch(masterURL);
+    const oldAd = assert.rejects(f.env.fetch(mediaURL), { name: 'AbortError' });
+    await f.env.fetch(mediaURL);
+    original = clean;
+    await f.env.fetch(mediaURL);
+    const before = f.messages.filter(message => message.type === 'status').length;
+    deferred(new Response(ad));
+    await oldAd;
+    assert.equal(f.messages.filter(message => message.type === 'status').length, before);
+    assert.equal(f.engine.getDiagnostics().recoveryTimers, 0);
+    await f.dispose();
+});
+
+test('ad sessions increase and every HEVC reload follows its matching blocking status', async () => {
+    let original = ad;
+    const originalMaster = master(mediaURL, 'hvc1.2.4') + master(backupURL).replace('#EXTM3U\n', '');
+    const f = setup({ fetch: async url => new Response(url === masterURL ? originalMaster : original) });
+    await f.env.fetch(masterURL);
+    await f.env.fetch(mediaURL);
+    const firstReload = f.messages.findIndex(message => message.type === 'reload');
+    const firstStart = f.messages.findIndex(message => message.type === 'status' && message.hasAds);
+    assert.ok(firstStart >= 0 && firstStart < firstReload);
+    assert.equal(f.messages[firstReload].adSession, f.messages[firstStart].adSession);
+    assert.equal(f.messages[firstReload].channel, 'channel');
+    original = clean;
+    await f.env.fetch(mediaURL);
+    const end = f.messages.find(message => message.type === 'status' && message.adEnded);
+    assert.equal(end.adSession, f.messages[firstStart].adSession);
+    assert.equal(end.clean, true);
+    original = ad;
+    await f.env.fetch(mediaURL);
+    const starts = f.messages.filter(message => message.type === 'status' && message.hasAds);
+    assert.ok(starts.at(-1).adSession > starts[0].adSession);
+    await f.dispose();
+});
+
+test('a new signed URL rebinds the original rendition and invalidates its stale recovery probe', async () => {
+    const renewed = 'https://video.example.invalid/live/renewed.m3u8?fixture=2';
+    let renewMaster = false;
+    let deferRecovery = false;
+    let oldRecovery;
+    let oldSignal;
+    const f = setup({ token: 'success', fetch: async (url, init) => {
+        if (url === masterURL) return new Response(master(renewMaster ? renewed : mediaURL));
+        if (url.includes('usher')) return new Response(master(backupURL));
+        if (url === mediaURL && deferRecovery) {
+            oldSignal = init.signal;
+            return new Promise(resolve => { oldRecovery = resolve; });
+        }
+        return new Response(url === backupURL || url === renewed ? clean : ad);
+    } });
+    await f.env.fetch(masterURL);
+    await f.env.fetch(mediaURL);
+    const session = f.messages.find(message => message.hasAds).adSession;
+    deferRecovery = true;
+    await f.advance(2000);
+    assert.equal(typeof oldRecovery, 'function');
+    renewMaster = true;
+    await f.env.fetch(masterURL);
+    assert.equal(oldSignal.aborted, true);
+    oldRecovery(new Response(clean));
+    await flush();
+    assert.equal(f.messages.some(message => message.adEnded), false);
+    await f.advance(2000);
+    assert.equal(f.messages.find(message => message.type === 'status' && message.adEnded).adSession, session);
+    assert.equal(f.engine.getDiagnostics().controllers, 0);
+    await f.dispose();
+});
+
+test('an unrelated master cannot prune an active ad session and strand its recovery', async () => {
+    let original = ad;
+    const otherMaster = masterURL.replace('channel.m3u8', 'other.m3u8');
+    const otherMedia = 'https://video.example.invalid/other/index.m3u8';
+    const f = setup({ token: 'success', options: { maxCacheEntries: 1, cacheTtlMs: 1000 }, fetch: async url => {
+        if (url === masterURL) return new Response(master());
+        if (url === otherMaster) return new Response(master(otherMedia));
+        if (url.includes('usher')) return new Response(master(backupURL));
+        return new Response(url === backupURL ? clean : original);
+    } });
+    await f.env.fetch(masterURL);
+    await f.env.fetch(mediaURL);
+    await f.advance(1500);
+    await f.env.fetch(otherMaster);
+    assert.equal(f.engine.getDiagnostics().streams, 1, 'the active stream is protected when pruning unrelated masters');
+    original = clean;
+    await f.advance(500);
+    assert.equal(f.messages.filter(message => message.type === 'status' && message.adEnded).length, 1);
     await f.dispose();
 });

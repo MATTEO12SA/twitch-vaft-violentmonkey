@@ -6,6 +6,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
     const protocol = 'vaft-matteo:1';
     let context = { ...initialContext };
     let serial = 0;
+    let adSerial = 0;
     let stopped = false;
     let simulateAds = false;
     const pending = new Map();
@@ -14,7 +15,6 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
     const blockedSegments = new Map();
     const controllers = new Set();
     const processedResponses = new WeakSet();
-    const qualityProbeIntervalMs = 8000;
     const variantProbeTimeoutMs = 2000;
     const candidateLimit = 4;
     const now = () => env.Date ? env.Date.now() : Date.now();
@@ -26,6 +26,23 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         const oldest = now() - config.cacheTtlMs;
         for (const [key, value] of map) if (value.at < oldest) map.delete(key);
         while (map.size > config.maxCacheEntries) map.delete(map.keys().next().value);
+    }
+
+    function removeStream(id, stream) {
+        env.clearTimeout(stream.retryTimer);
+        stream.searchController?.abort();
+        stream.refreshController?.abort();
+        stream.recoveryController?.abort();
+        streams.delete(id);
+        for (const [url, entry] of media) if (entry.stream === stream) media.delete(url);
+    }
+
+    function pruneStreams() {
+        const oldest = now() - config.cacheTtlMs;
+        for (const [id, stream] of streams) {
+            const current = context.kind === stream.kind && String(context.id).toLowerCase() === String(id).toLowerCase();
+            if (!current && (stream.at < oldest || streams.size > config.maxCacheEntries)) removeStream(id, stream);
+        }
     }
 
     function remember(map, key, value) {
@@ -72,8 +89,10 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             if (next.kind === stream.kind && String(next.id).toLowerCase() === String(id).toLowerCase()) {
                 stream.epoch = next.epoch;
                 stream.job = null;
-                stream.qualityJob = null;
-            } else streams.delete(id);
+                stream.recoveryController = null;
+                stream.refreshController = null;
+                stream.generation++;
+            } else removeStream(id, stream);
         }
         for (const [url, entry] of media) if (!streams.has(entry.stream.id)) media.delete(url);
         blockedSegments.clear();
@@ -81,7 +100,10 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         simulateAds = false;
         // An empty waiting manifest can stop native polling. Re-arm the retained
         // channel's recovery under the new epoch when its video/decoder changes.
-        for (const stream of streams.values()) if (stream.hadAds) scheduleRecovery(stream, stream.recoveryTarget);
+        for (const stream of streams.values()) if (stream.hadAds) {
+            status(stream, stream.state, true);
+            scheduleRecovery(stream, stream.recoveryTarget);
+        }
     }
 
     function onMessage(event) {
@@ -107,21 +129,62 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         if (!stream) {
             stream = { id, kind: kind.kind === 'live-master' ? 'live' : 'vod', url: url.href,
                 epoch, state: 'playing', attempt: 0, nextRetry: 0, job: null, backup: null,
-                qualityJob: null, qualityController: null,
-                hadAds: false, codecFallback: false, variants, retryTimer: null, recoveryTarget: null, generation: 0, at: now() };
+                adSession: 0, hadAds: false, codecFallback: false, variants, retryTimer: null, recoveryTarget: null, recoveryRevision: 0, generation: 0, at: now() };
             streams.set(id, stream);
         }
         stream.url = url.href;
+        // Signed media URLs can rotate without changing the chosen rendition.
+        // Rebind only an unambiguous exact rendition; a different quality cannot
+        // redefine what proves the end of this ad session.
+        const pinned = stream.recoveryTarget;
+        if (stream.hadAds && pinned && !variants.some(variant => variant.Url === pinned.Url)) {
+            const matches = variants.filter(variant => pinned.Codecs && pinned.Resolution &&
+                variant.Codecs === pinned.Codecs && variant.Resolution === pinned.Resolution && variant.FrameRate === pinned.FrameRate);
+            if (matches.length === 1) {
+                stream.recoveryTarget = matches[0];
+                stream.recoveryRevision++;
+                stream.recoveryController?.abort();
+                stream.recoveryController = null;
+                env.clearTimeout(stream.retryTimer);
+                stream.retryTimer = null;
+                scheduleRecovery(stream, stream.recoveryTarget);
+            }
+        }
         stream.variants = variants;
         stream.at = now();
         for (const variant of variants) remember(media, variant.Url, { stream, variant });
-        prune(streams);
+        pruneStreams();
         return stream;
     }
 
-    function status(stream, state, hasAds = stream.hadAds) {
+    function status(stream, state, hasAds = stream.hadAds, details = {}) {
         stream.state = state;
-        if (stream.epoch === context.epoch) send('status', { state, hasAds });
+        if (stream.epoch === context.epoch) send('status', {
+            state, hasAds, channel: stream.id,
+            adSession: hasAds || details.adEnded ? stream.adSession : 0, ...details
+        });
+    }
+
+    function reload(stream) {
+        send('reload', { channel: stream.id, adSession: stream.adSession, adEnded: !stream.hadAds });
+    }
+
+    function finishAd(stream) {
+        stream.generation++;
+        stream.searchController?.abort();
+        stream.recoveryController?.abort();
+        stream.refreshController?.abort();
+        env.clearTimeout(stream.retryTimer);
+        stream.retryTimer = null;
+        stream.hadAds = false;
+        stream.recoveryTarget = null;
+        stream.codecFallback = false;
+        stream.backup = null;
+        stream.job = null;
+        stream.attempt = 0;
+        stream.nextRetry = 0;
+        status(stream, 'resuming', false, { adEnded: true, clean: true });
+        reload(stream);
     }
 
     function codecFamily(codecs) {
@@ -274,7 +337,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                 // Do not splice incompatible codecs into a running decoder.
                 const compatible = compatibleVariants(variants, target);
                 const result = await probeVariants(chooseCandidates(compatible, target, stream.attempt), signal);
-                if (result) return { ...result, alternatives: compatible, qualityRound: 0, nextQualityProbe: now() + qualityProbeIntervalMs };
+                if (result) return result;
             } catch (failure) {
                 if (signal.aborted) throw failure;
             }
@@ -285,7 +348,6 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
     function beginSearch(stream, target) {
         if (stream.job) return stream.job;
         if (now() < stream.nextRetry) return Promise.resolve(null);
-        stream.qualityController?.abort();
         status(stream, 'searching', true);
         const controller = new env.AbortController();
         controllers.add(controller);
@@ -317,85 +379,57 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         return job;
     }
 
-    function improveQuality(stream, cached, target) {
-        if (stream.qualityJob || now() < cached.nextQualityProbe || !stream.hadAds) return;
-        const higher = (cached.alternatives || []).filter(variant => variantArea(variant) > variantArea(cached.variant));
-        const candidates = chooseCandidates(higher, target, cached.qualityRound++);
-        cached.nextQualityProbe = now() + qualityProbeIntervalMs;
-        if (!candidates.length) return;
-        const controller = new env.AbortController();
-        controllers.add(controller);
-        stream.qualityController = controller;
-        const timer = env.setTimeout(() => controller.abort(), config.requestTimeoutMs);
-        const epoch = context.epoch;
-        const generation = stream.generation;
-        const job = probeVariants(candidates, controller.signal).then(result => {
-            if (!result || controller.signal.aborted || epoch !== context.epoch || generation !== stream.generation ||
-                !stream.hadAds || stream.backup !== cached || variantArea(result.variant) <= variantArea(cached.variant) ||
-                !fitsTarget(result.variant, stream.recoveryTarget || target)) return;
-            stream.backup = { ...result, alternatives: cached.alternatives, qualityRound: 0, nextQualityProbe: now() + qualityProbeIntervalMs };
-        }).catch(() => {}).finally(() => {
-            env.clearTimeout(timer);
-            controllers.delete(controller);
-            if (stream.qualityController === controller) stream.qualityController = null;
-            if (stream.qualityJob === job) stream.qualityJob = null;
-        });
-        stream.qualityJob = job;
-    }
-
     function scheduleRecovery(stream, target) {
-        if (stream.retryTimer || !target?.Url || stopped || !stream.hadAds) return;
+        if (stream.retryTimer || stream.recoveryController || !target?.Url || stopped || !stream.hadAds) return;
         const epoch = context.epoch;
         const generation = stream.generation;
         stream.retryTimer = env.setTimeout(async () => {
             stream.retryTimer = null;
             if (epoch !== context.epoch || !liveChannel(stream.id) || !stream.hadAds) return;
             const currentTarget = stream.recoveryTarget || target;
+            const recoveryRevision = stream.recoveryRevision;
             const controller = new env.AbortController();
             controllers.add(controller);
+            stream.recoveryController = controller;
             try {
                 const text = await auxiliary(currentTarget.Url, controller.signal);
-                if (epoch !== context.epoch || generation !== stream.generation || !stream.hadAds) return;
+                if (epoch !== context.epoch || generation !== stream.generation || recoveryRevision !== stream.recoveryRevision || !stream.hadAds) return;
                 const inspection = hls.inspectMedia(text, currentTarget.Url);
-                if (!inspection.hasAds && !simulateAds) {
-                    stream.generation++;
-                    stream.searchController?.abort();
-                    stream.qualityController?.abort();
-                    stream.hadAds = false;
-                    stream.recoveryTarget = null;
-                    stream.codecFallback = false;
-                    stream.backup = null;
-                    stream.attempt = 0;
-                    stream.nextRetry = 0;
-                    status(stream, 'resuming', false);
-                    send('reload');
+                if (!inspection.hasAds && !simulateAds && inspection.segments.length) {
+                    finishAd(stream);
                     return;
                 }
                 const wasWaiting = stream.state !== 'playing';
                 const result = await backupText(stream, currentTarget);
-                if (epoch === context.epoch && result && wasWaiting) send('reload');
+                if (epoch === context.epoch && generation === stream.generation && result && wasWaiting) reload(stream);
             } catch {
-                if (epoch !== context.epoch || generation !== stream.generation) return;
+                if (epoch !== context.epoch || generation !== stream.generation || recoveryRevision !== stream.recoveryRevision) return;
                 const index = Math.min(stream.attempt++, config.retryDelaysMs.length - 1);
                 stream.nextRetry = now() + config.retryDelaysMs[index];
             } finally {
                 controllers.delete(controller);
-                if (epoch === context.epoch && generation === stream.generation && stream.hadAds) scheduleRecovery(stream, currentTarget);
+                if (stream.recoveryController === controller) stream.recoveryController = null;
+                if (epoch === context.epoch && generation === stream.generation && stream.hadAds) scheduleRecovery(stream, stream.recoveryTarget);
             }
         }, Math.max(config.retryDelaysMs[0], stream.nextRetry - now()));
     }
 
     async function backupText(stream, target) {
+        const epoch = context.epoch;
+        const generation = stream.generation;
+        const sameCodec = variant => !!codecFamily(target?.Codecs) && codecFamily(variant?.Codecs) === codecFamily(target.Codecs);
         const cached = stream.backup;
-        if (cached && fitsTarget(cached.variant, target)) {
-            improveQuality(stream, cached, target);
-            // Deduplicate simultaneous playlist requests; never replay a stale playlist indefinitely.
+        if (cached) {
+            // A stray request for another quality must not replace the working
+            // fallback. A different codec cannot be spliced into that decoder.
+            if (!sameCodec(cached.variant)) return null;
             if (now() - cached.at < 500) return cached.text;
             if (!stream.job) {
                 const controller = new env.AbortController();
                 controllers.add(controller);
+                stream.refreshController = controller;
                 const job = auxiliary(cached.url, controller.signal).then(text => {
-                    if (stream.epoch !== context.epoch) throw error('AbortError');
+                    if (epoch !== context.epoch || generation !== stream.generation || stream.backup !== cached) throw error('AbortError');
                     const inspection = hls.inspectMedia(text, cached.url);
                     if (inspection.hasAds || simulateAds || !inspection.segments.length) return null;
                     cached.text = absolutize(inspection.sanitizedText, cached.url);
@@ -403,24 +437,26 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                     return cached;
                 }).catch(() => null).finally(() => {
                     controllers.delete(controller);
+                    if (stream.refreshController === controller) stream.refreshController = null;
                     if (stream.job === job) stream.job = null;
                 });
                 stream.job = job;
             }
             const refreshed = await stream.job;
-            // A background promotion may finish while this lower-quality poll is pending.
-            if (stream.backup !== cached && stream.backup && fitsTarget(stream.backup.variant, target)) return backupText(stream, target);
-            if (refreshed && fitsTarget(refreshed.variant, target)) return refreshed.text;
-            stream.qualityController?.abort();
-            stream.backup = null;
+            if (epoch !== context.epoch || generation !== stream.generation) throw error('AbortError');
+            if (refreshed && sameCodec(refreshed.variant)) return refreshed.text;
+            if (stream.backup === cached) stream.backup = null;
         }
-        const result = await beginSearch(stream, target);
-        // A concurrent request can target a different quality. Never serve it the wrong codec.
-        if (result && fitsTarget(result.variant, target)) return result.text;
-        return null;
+        // Preserve the initial resolution preference even if an in-flight
+        // request for a different quality arrives while the player is locked.
+        const pinned = stream.recoveryTarget;
+        const searchTarget = pinned && sameCodec(pinned) ? pinned : target;
+        const result = await beginSearch(stream, searchTarget);
+        if (epoch !== context.epoch || generation !== stream.generation) throw error('AbortError');
+        return result && sameCodec(result.variant) ? result.text : null;
     }
 
-    async function processMedia(stream, variant, url, text) {
+    async function processMedia(stream, variant, url, text, requestState) {
         const epoch = context.epoch;
         const inspection = hls.inspectMedia(text, url.href);
         if (stream.kind === 'vod') {
@@ -431,39 +467,41 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             return text; // Preserve VOD timeline and TwitchNoSub's response.
         }
         if (!liveChannel(stream.id)) return text;
-        if (!inspection.hasAds && !simulateAds) {
-            if (stream.hadAds) {
-                stream.generation++;
-                stream.searchController?.abort();
-                stream.qualityController?.abort();
-                env.clearTimeout(stream.retryTimer);
-                stream.retryTimer = null;
-                stream.hadAds = false;
-                stream.recoveryTarget = null;
-                stream.backup = null;
-                stream.nextRetry = 0;
-                stream.attempt = 0;
-                status(stream, 'resuming', false);
-                stream.codecFallback = false;
-                send('reload');
-            }
-            status(stream, 'playing', false);
+        const fresh = requestState.generation === stream.generation;
+        // Requests already in flight when this ad started may join its fallback,
+        // but can never end it. Results from an older completed ad are discarded.
+        if (!fresh && !(stream.hadAds && !requestState.hadAds && requestState.generation === stream.generation - 1)) {
+            throw error('AbortError');
+        }
+        const hasAds = inspection.hasAds || simulateAds;
+        if (!hasAds && !stream.hadAds) {
+            if (inspection.segments.length) status(stream, 'playing', false, { clean: true });
             return inspection.sanitizedText;
         }
-        stream.hadAds = true;
-        stream.recoveryTarget = variant;
+        if (!hasAds && fresh && inspection.segments.length && url.href === stream.recoveryTarget?.Url) {
+            finishAd(stream);
+            return inspection.sanitizedText;
+        }
+        if (!stream.hadAds) {
+            stream.hadAds = true;
+            stream.adSession = ++adSerial;
+            stream.generation++;
+            stream.recoveryTarget = variant;
+            // Lock the page player before any decoder replacement is requested.
+            status(stream, 'searching', true);
+        }
         const generation = stream.generation;
         for (const segment of inspection.segments) if (segment.isAd) remember(blockedSegments, segment.url, {});
         if (codecFamily(variant?.Codecs) === 'hevc' && !stream.codecFallback &&
             stream.variants.some(item => ['avc', 'av1'].includes(codecFamily(item.Codecs)))) {
             stream.codecFallback = true;
-            send('reload');
+            reload(stream);
         }
         const clean = await backupText(stream, variant);
         if (epoch !== context.epoch || generation !== stream.generation) throw error('AbortError');
+        scheduleRecovery(stream, stream.recoveryTarget);
         if (clean) return clean;
-        status(stream, 'waiting-ad', true);
-        scheduleRecovery(stream, variant);
+        if (!stream.backup) status(stream, 'waiting-ad', true);
         return waitingManifest(text);
     }
 
@@ -479,6 +517,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         const known = media.get(url.href);
         const master = kind.kind === 'live-master' || kind.kind === 'vod-master';
         if (!master && !known) return fetcher(input, init);
+        const requestState = known ? { generation: known.stream.generation, hadAds: known.stream.hadAds } : null;
         const response = await fetcher(input, init);
         if (!response.ok) return response;
         if (processedResponses.has(response)) return response;
@@ -502,7 +541,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             const stream = registerMaster(url, text, kind, epoch);
             if (stream?.kind === 'live' && liveChannel(stream.id) && stream.codecFallback) changed = fallbackMaster(stream, text, url.href);
         } else {
-            const processing = processMedia(known.stream, known.variant, url, text);
+            const processing = processMedia(known.stream, known.variant, url, text, requestState);
             let onAbort;
             try {
                 const aborting = new Promise((resolve, reject) => {

@@ -133,7 +133,7 @@ function setup(t, options = {}) {
         playerCallbacks = callbacks;
         return {
             start() {}, stop() {}, getContext() { return { ...playerContext }; },
-            setStatus(status) { statuses.push(status); },
+            setStatus(status) { statuses.push(status); return options.onStatus?.(status); },
             task(task) { tasks.push(task); },
             setVodRanges(value) { ranges.push(value); },
             getDiagnostics() { return {}; }
@@ -274,13 +274,14 @@ test('only a current live Worker can request recovery of an unstarted player', t
     const { worker } = h.createWorker();
     worker.run();
     for (const override of [{ namespace: 'unrelated' }, { workerId: 999 }, { epoch: 0 }]) {
-        h.send(worker, { type: 'reload', ...override });
+        h.send(worker, { type: 'reload', channel: 'example', adSession: 1, ...override });
     }
     assert.deepEqual(h.tasks, []);
-    h.send(worker, { type: 'reload' });
+    h.send(worker, { type: 'status', channel: 'example', adSession: 1, state: 'searching', hasAds: true });
+    h.send(worker, { type: 'reload', channel: 'example', adSession: 1 });
     assert.deepEqual(h.tasks, [{ reload: true, adRecovery: true }]);
     h.changeContext({ kind: 'vod', id: '123', epoch: 2 });
-    h.send(worker, { type: 'reload' });
+    h.send(worker, { type: 'reload', channel: 'example', adSession: 1 });
     assert.equal(h.tasks.length, 1, 'VOD must not inherit live ad recovery');
 });
 
@@ -357,4 +358,97 @@ test('Worker errors shut down the engine and stop restores page fetch and debug 
     assert.equal('__VAFT_MATTEO_DEBUG__' in h.window, false);
     assert.equal(h.window.listenerCount(), 0);
     assert.equal(worker.terminated, false);
+});
+
+test('quality unlock requires a clean end from the active ad session, then requests recovery once', t => {
+    const h = setup(t);
+    const { worker } = h.createWorker();
+    const { worker: unrelated } = h.createWorker();
+    worker.run(); unrelated.run();
+    const active = { type: 'status', channel: 'example', adSession: 1, state: 'searching', hasAds: true };
+    h.send(worker, active);
+    assert.equal(h.statuses.at(-1).hasAds, true);
+    const count = h.statuses.length;
+    for (const change of [
+        { adSession: 0 }, { channel: 'elsewhere' }, { epoch: 0 }, { clean: false }, { adEnded: false }
+    ]) h.send(worker, { ...active, state: 'resuming', hasAds: false, clean: true, adEnded: true, ...change });
+    h.send(unrelated, { ...active, state: 'playing', hasAds: false, clean: true, adEnded: true });
+    h.send(unrelated, { ...active, state: 'playing', hasAds: false, clean: true, adSession: 0 });
+    assert.equal(h.statuses.length, count);
+    assert.equal(h.tasks.length, 0);
+    h.send(worker, { ...active, state: 'resuming', hasAds: false, clean: true, adEnded: true });
+    assert.deepEqual(h.statuses.at(-1), { state: 'resuming', hasAds: false, adEnded: true, deferQuality: true,
+        id: 'example', epoch: 1 });
+    assert.deepEqual(h.tasks, [{ reload: true, adRecovery: true }]);
+    h.send(worker, { type: 'reload', channel: 'example', adSession: 1 });
+    h.send(worker, active);
+    assert.equal(h.tasks.length, 1, 'a duplicate terminal reload must not restart a restored player');
+    assert.equal(h.statuses.at(-1).hasAds, false, 'late messages cannot reopen the closed session');
+});
+
+test('independent active Worker sessions cannot unlock each other', t => {
+    const h = setup(t);
+    const { worker: first } = h.createWorker();
+    const { worker: second } = h.createWorker();
+    first.run(); second.run();
+    const status = { type: 'status', channel: 'example', adSession: 1, state: 'playing', hasAds: true };
+    h.send(first, status); h.send(second, status);
+    h.send(first, { ...status, hasAds: false, clean: true, adEnded: true });
+    assert.equal(h.statuses.at(-1).hasAds, true);
+    assert.equal(h.tasks.length, 0);
+    h.send(second, { ...status, hasAds: false, clean: true, adEnded: true });
+    assert.equal(h.statuses.at(-1).adEnded, true);
+    assert.equal(h.tasks.length, 1);
+});
+
+test('same-channel epochs retain the lock while navigation discards old ownership', t => {
+    const h = setup(t);
+    const { worker } = h.createWorker(); worker.run();
+    const status = { type: 'status', channel: 'example', adSession: 2, state: 'playing', hasAds: true };
+    h.send(worker, status);
+    h.changeContext({ kind: 'live', id: 'example', epoch: 2 });
+    h.send(worker, { ...status, epoch: 1, hasAds: false, clean: true, adEnded: true });
+    assert.equal(h.tasks.length, 0);
+    h.send(worker, { ...status, hasAds: false, clean: true, adEnded: true });
+    assert.equal(h.tasks.length, 1);
+    h.changeContext({ kind: 'live', id: 'other', epoch: 3 });
+    const count = h.statuses.length;
+    h.send(worker, status);
+    assert.equal(h.statuses.length, count);
+    h.send(worker, { ...status, channel: 'other', adSession: 3 });
+    assert.equal(h.statuses.at(-1).hasAds, true);
+});
+
+test('a terminated ad Worker remains locked until a newer replacement verifies clean media', t => {
+    const h = setup(t);
+    const { worker: old } = h.createWorker();
+    const { worker } = h.createWorker(); old.run(); worker.run();
+    const status = { type: 'status', channel: 'example', adSession: 1, state: 'playing', hasAds: true };
+    h.send(worker, status);
+    worker.emit('error');
+    assert.equal(h.statuses.at(-1).hasAds, true, 'a technical error is not the end of an ad');
+    h.send(old, { ...status, adSession: 0, hasAds: false, clean: true });
+    assert.equal(h.tasks.length, 0, 'an unrelated older Worker cannot release the orphan lock');
+    const { worker: replacement } = h.createWorker(); replacement.run();
+    h.send(replacement, { ...status, adSession: 0, hasAds: false });
+    assert.equal(h.tasks.length, 0, 'empty/unclassified media does not confirm recovery');
+    h.send(replacement, { ...status, adSession: 0, hasAds: false, clean: true });
+    assert.equal(h.statuses.at(-1).adEnded, true);
+    assert.equal(h.tasks.length, 1);
+});
+
+test('a route discovered while delivering status cannot reload the new channel', t => {
+    let h;
+    h = setup(t, { onStatus(status) {
+        if (!status.adEnded) return true;
+        h.changeContext({ kind: 'live', id: 'newchannel', epoch: 2 });
+        return false;
+    } });
+    const { worker } = h.createWorker(); worker.run();
+    const status = { type: 'status', channel: 'example', adSession: 1, state: 'playing', hasAds: true };
+    h.send(worker, status);
+    h.send(worker, { ...status, hasAds: false, clean: true, adEnded: true });
+    assert.equal(h.statuses.at(-1).id, 'example');
+    assert.equal(h.statuses.at(-1).epoch, 1);
+    assert.equal(h.tasks.length, 0);
 });

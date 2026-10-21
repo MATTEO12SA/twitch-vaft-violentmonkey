@@ -128,8 +128,8 @@ function setup(options = {}, path = '/channel') {
     function mutate(addedNodes, removedNodes = [], target = root) {
         observers.filter(item => item.active).forEach(item => item.emit([{ target, addedNodes, removedNodes }]));
     }
-    function addReact() {
-        const player = { getHTMLVideoElement: () => video, pause: () => video.pause(), play: () => video.play() };
+    function addReact(targetVideo = video) {
+        const player = { getHTMLVideoElement: () => targetVideo, pause: () => targetVideo.pause(), play: () => targetVideo.play() };
         const state = { calls: 0, setSrc() { this.calls++; }, setInitialPlaybackSettings() {} };
         root._reactRootContainer = { _internalRoot: { current: {
             stateNode: { setPlayerActive() {}, props: { mediaPlayerInstance: player } },
@@ -158,6 +158,505 @@ test('start is idempotent; stop clears timers, observers and all listeners', () 
     assert.equal(f.observers.filter(item => item.active).length, 0);
     assert.equal(f.video.listenerCount(), 0);
     assert.equal(f.win.listenerCount(), 0);
+});
+
+function qualityPlayer(f, target = f.video, auto = true) {
+    const { player, state } = f.addReact(target);
+    const api = {
+        player, state, auto,
+        qualities: [
+            { group: 'chunked', name: '1080p60 (Source)', width: 1920, height: 1080, framerate: 60 },
+            { group: '720p60', name: '720p60', width: 1280, height: 720, framerate: 60 },
+            { group: '160p30', name: '160p', width: 284, height: 160, framerate: 30 }
+        ],
+        manualCalls: [], autoCalls: []
+    };
+    api.current = api.qualities[0];
+    player.getQualities = () => api.qualities;
+    player.getQuality = () => api.current;
+    player.isAutoQualityMode = () => api.auto;
+    player.setQuality = function (value, smooth) {
+        assert.ok(api.qualities.includes(value), 'the decoder receives only a current manifest quality object');
+        api.manualCalls.push({ value, smooth });
+        api.current = value;
+        api.auto = false;
+    };
+    player.setAutoQualityMode = function (enabled) { api.autoCalls.push(enabled); api.auto = enabled; };
+    api.originalManual = player.setQuality;
+    api.originalAuto = player.setAutoQualityMode;
+    return api;
+}
+
+function endAd(f) {
+    f.controller.setStatus({ state: 'resuming', hasAds: false, adEnded: true, deferQuality: true });
+    return f.controller.task({ reload: true, adRecovery: true });
+}
+
+test('ad quality lock suppresses decoder switches and applies only the last choice after recovery metadata', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const api = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ state: 'searching', hasAds: true });
+    api.player.setQuality(api.qualities[2]);
+    api.player.setAutoQualityMode(true);
+    api.player.setQuality(api.qualities[1]);
+    assert.deepEqual(api.manualCalls, []);
+    assert.deepEqual(api.autoCalls, [false], 'ABR is frozen without issuing a rendition switch');
+    assert.equal(api.state.calls, 0);
+    assert.equal(f.video.pauseCalls, 0);
+    assert.equal(f.video.playCalls, 0);
+
+    f.controller.setStatus({ state: 'playing', hasAds: false });
+    f.video.emit('loadedmetadata');
+    assert.deepEqual(api.manualCalls, [], 'an unconfirmed status does not release queued quality');
+    f.controller.setStatus({ state: 'resuming', hasAds: false, adEnded: true, deferQuality: true });
+    f.video.emit('playing');
+    assert.deepEqual(api.manualCalls, [], 'old source events before the recovery reload are ignored');
+    assert.equal(f.controller.task({ reload: true, adRecovery: true }), true);
+    assert.equal(api.state.calls, 1);
+    assert.deepEqual(api.manualCalls, [], 'setSrc is not followed by an immediate old-manifest switch');
+
+    api.qualities = api.qualities.map(item => ({ ...item }));
+    f.video.emit('loadedmetadata');
+    assert.deepEqual(api.manualCalls, [{ value: api.qualities[1], smooth: true }]);
+    assert.equal(api.player.setQuality, api.originalManual);
+    assert.equal(api.player.setAutoQualityMode, api.originalAuto);
+    assert.equal(f.controller.getDiagnostics().qualityLocked, false);
+    f.video.emit('playing');
+    f.video.emit('loadedmetadata');
+    assert.equal(api.manualCalls.length, 1, 'the queued choice is consumed exactly once');
+    assert.equal(f.video.muted, true);
+    assert.equal(f.video.volume, 0.3);
+});
+
+test('Auto supersedes queued manual choices and untouched Auto is restored after blocking', () => {
+    for (const chooseAuto of [false, true]) {
+        const f = setup();
+        f.video.readyState = 4;
+        const api = qualityPlayer(f);
+        f.controller.start();
+        f.controller.setStatus({ hasAds: true });
+        f.controller.setStatus({ hasAds: true });
+        if (chooseAuto) {
+            api.player.setQuality(api.qualities[2]);
+            api.player.setAutoQualityMode(true);
+        }
+        assert.deepEqual(api.autoCalls, [false]);
+        assert.equal(endAd(f), true);
+        f.video.emit('loadedmetadata');
+        assert.deepEqual(api.manualCalls, []);
+        assert.deepEqual(api.autoCalls, [false, true]);
+        assert.equal(f.controller.getDiagnostics().qualityLocked, false);
+    }
+});
+
+test('an untouched manual setting is restored with a fresh quality object after blocking', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const api = qualityPlayer(f, f.video, false);
+    api.current = api.qualities[1];
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    assert.equal(endAd(f), true);
+    api.qualities = api.qualities.map(item => ({ ...item }));
+    f.video.emit('loadedmetadata');
+    assert.deepEqual(api.manualCalls, [{ value: api.qualities[1], smooth: true }]);
+    assert.deepEqual(api.autoCalls, []);
+});
+
+test('a pause defers end-of-ad recovery and a later pause remains authoritative during quality restoration', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const api = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    api.player.setQuality(api.qualities[1]);
+    f.video.pause();
+    assert.equal(endAd(f), false);
+    f.advance(10000);
+    f.video.emit('loadedmetadata');
+    assert.equal(api.state.calls, 0);
+    assert.equal(api.manualCalls.length, 0);
+    assert.equal(f.video.playCalls, 0);
+    f.video.play();
+    f.advance(600);
+    assert.equal(api.state.calls, 1);
+    f.video.pause();
+    f.video.emit('loadedmetadata');
+    assert.equal(api.manualCalls.length, 1);
+    assert.equal(f.video.paused, true);
+    assert.equal(f.video.playCalls, 1, 'only the user play is issued');
+    assert.equal(f.video.muted, true);
+    assert.equal(f.video.volume, 0.3);
+});
+
+test('end-of-ad recovery survives the reload cooldown and never repeats while waiting for metadata', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const api = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    assert.equal(f.controller.task({ reload: true, adRecovery: true }), true);
+    api.player.setQuality(api.qualities[1]);
+    assert.equal(endAd(f), false);
+    f.advance(7800);
+    assert.equal(api.state.calls, 1);
+    f.advance(600);
+    assert.equal(api.state.calls, 2);
+    f.advance(12000);
+    assert.equal(api.state.calls, 2);
+    assert.equal(api.manualCalls.length, 0);
+    f.video.emit('loadedmetadata');
+    assert.equal(api.manualCalls.length, 1);
+});
+
+test('quality protection attaches after React hydration without scanning on every ordinary tick', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    const api = qualityPlayer(f);
+    f.advance(2400);
+    api.player.setQuality(api.qualities[2]);
+    assert.equal(api.manualCalls.length, 0);
+    const scans = f.controller.getDiagnostics().metrics.reactScans;
+    f.advance(6000);
+    assert.equal(f.controller.getDiagnostics().metrics.reactScans, scans);
+    assert.equal(endAd(f), true);
+    f.video.emit('loadedmetadata');
+    assert.equal(api.manualCalls[0].value, api.qualities[2]);
+});
+
+test('a React player instance replaced on the same video gets the quality guard without repeated scans', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const old = qualityPlayer(f);
+    const fiber = f.root._reactRootContainer._internalRoot.current;
+    const component = fiber.stateNode;
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    old.player.setQuality(old.qualities[1]);
+    const before = f.controller.getDiagnostics().metrics.reactScans;
+
+    const current = qualityPlayer(f);
+    component.props = { mediaPlayerInstance: { playerInstance: current.player } };
+    f.root._reactRootContainer._internalRoot.current = fiber;
+    f.advance(3000);
+    current.player.setQuality(current.qualities[2]);
+    assert.equal(current.manualCalls.length, 0, 'the new decoder does not receive the menu choice during blocking');
+    assert.equal(old.player.setQuality, old.originalManual, 'the retired player is released');
+    assert.equal(f.controller.getDiagnostics().metrics.reactScans, before + 1);
+    f.advance(3000);
+    assert.equal(f.controller.getDiagnostics().metrics.reactScans, before + 1, 'unchanged associations use pointer checks');
+    assert.equal(endAd(f), true);
+    f.video.emit('loadedmetadata');
+    assert.equal(old.manualCalls.length, 0);
+    assert.deepEqual(current.manualCalls, [{ value: current.qualities[2], smooth: true }]);
+});
+
+test('media lifecycle events rebind a replacement React component that reuses the same video', () => {
+    for (const boundary of ['loadedmetadata', 'emptied', 'loadstart']) {
+        const f = setup();
+        f.video.readyState = 4;
+        const old = qualityPlayer(f);
+        f.controller.start();
+        f.controller.setStatus({ hasAds: true });
+        old.player.setQuality(old.qualities[1]);
+        const current = qualityPlayer(f);
+        f.video.emit(boundary);
+        current.player.setQuality(current.qualities[2]);
+        assert.equal(current.manualCalls.length, 0);
+        assert.equal(old.player.setQuality, old.originalManual);
+        assert.equal(f.controller.getDiagnostics().qualityLocked, true);
+        assert.equal(endAd(f), true);
+        f.video.emit('loadedmetadata');
+        assert.equal(old.manualCalls.length, 0);
+        assert.deepEqual(current.manualCalls, [{ value: current.qualities[2], smooth: true }]);
+    }
+});
+
+test('a changed React root including an alternate commit rebinds a new player on the same video', () => {
+    for (const useAlternate of [false, true]) {
+        const f = setup();
+        f.video.readyState = 4;
+        const old = qualityPlayer(f);
+        f.controller.start();
+        f.controller.setStatus({ hasAds: true });
+        old.player.setQuality(old.qualities[1]);
+        const before = f.controller.getDiagnostics().metrics.reactScans;
+        const root = f.root._reactRootContainer._internalRoot.current;
+        f.advance(3000);
+        assert.equal(f.controller.getDiagnostics().metrics.reactScans, before, 'an unchanged root does not trigger repeated scans');
+        const current = qualityPlayer(f);
+        if (useAlternate) {
+            const nextRoot = f.root._reactRootContainer._internalRoot.current;
+            root.alternate = nextRoot;
+            nextRoot.alternate = root;
+        }
+        f.advance(3000);
+        current.player.setQuality(current.qualities[2]);
+        assert.equal(current.manualCalls.length, 0, 'a new component receives the guard even when its root is an alternate of the previous tree');
+        assert.equal(old.player.setQuality, old.originalManual);
+        assert.equal(f.controller.getDiagnostics().metrics.reactScans, before + 1);
+        assert.equal(endAd(f), true);
+        f.video.emit('loadedmetadata');
+        assert.deepEqual(current.manualCalls, [{ value: current.qualities[2], smooth: true }]);
+    }
+});
+
+test('old buffered playing after an asynchronous recovery reload cannot consume the queued quality', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const api = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    api.player.setQuality(api.qualities[1]);
+    assert.equal(endAd(f), true);
+    f.video.emit('playing');
+    f.advance(3000);
+    assert.equal(api.manualCalls.length, 0, 'old buffered media has not crossed a new-source boundary');
+    assert.equal(f.controller.getDiagnostics().qualityRecovery, 'waiting-media');
+    assert.equal(api.state.calls, 1, 'waiting for fresh media never repeats the reload');
+    api.qualities = api.qualities.map(item => ({ ...item }));
+    f.video.emit('loadedmetadata');
+    f.video.emit('playing');
+    assert.deepEqual(api.manualCalls, [{ value: api.qualities[1], smooth: true }]);
+    assert.equal(f.controller.getDiagnostics().qualityLocked, false);
+});
+
+test('playing can complete recovery on the same video only after a new load boundary', () => {
+    for (const boundary of ['emptied', 'loadstart']) {
+        const f = setup();
+        f.video.readyState = 4;
+        const api = qualityPlayer(f);
+        f.controller.start();
+        f.controller.setStatus({ hasAds: true });
+        api.player.setQuality(api.qualities[1]);
+        // An event preceding the reload does not count as its new media.
+        f.video.emit(boundary);
+        assert.equal(endAd(f), true);
+        f.video.emit('playing');
+        assert.equal(api.manualCalls.length, 0);
+        f.video.readyState = 0;
+        f.video.emit(boundary);
+        f.video.emit('playing');
+        assert.equal(api.manualCalls.length, 0, 'a boundary alone is not playable media');
+        f.video.readyState = 4;
+        api.qualities = api.qualities.map(item => ({ ...item }));
+        f.video.emit('playing');
+        assert.deepEqual(api.manualCalls, [{ value: api.qualities[1], smooth: true }]);
+        f.video.emit('loadedmetadata');
+        assert.equal(api.manualCalls.length, 1);
+    }
+});
+
+test('same-channel player replacement keeps the ad lock and last choice without retaining old player methods', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const old = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    old.player.setQuality(old.qualities[1]);
+    const replacement = new Video();
+    replacement.readyState = 4;
+    f.video.remove();
+    f.playerContainer.appendChild(replacement);
+    const current = qualityPlayer(f, replacement);
+    f.mutate([replacement], [f.video]);
+    f.advance(150);
+    assert.equal(old.player.setQuality, old.originalManual);
+    assert.equal(f.controller.getDiagnostics().status.hasAds, true);
+    assert.equal(f.controller.getDiagnostics().qualityLocked, true);
+    current.player.setQuality(current.qualities[2]);
+    assert.equal(current.manualCalls.length, 0);
+    assert.equal(endAd(f), true);
+    replacement.emit('loadedmetadata');
+    assert.equal(old.manualCalls.length, 0);
+    assert.deepEqual(current.manualCalls, [{ value: current.qualities[2], smooth: true }]);
+});
+
+test('already loaded replacement media completes a pending recovery even if its metadata event was missed', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const old = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    old.player.setQuality(old.qualities[1]);
+    assert.equal(endAd(f), true);
+    const replacement = new Video();
+    replacement.readyState = 4;
+    f.video.remove();
+    f.playerContainer.appendChild(replacement);
+    const current = qualityPlayer(f, replacement);
+    f.mutate([replacement], [f.video]);
+    f.advance(150);
+    assert.equal(old.manualCalls.length, 0);
+    assert.deepEqual(current.manualCalls, [{ value: current.qualities[1], smooth: true }]);
+    assert.equal(f.controller.getDiagnostics().qualityLocked, false);
+});
+
+test('channel/VOD navigation discards a queued choice and restores the original quality methods', () => {
+    for (const path of ['/another_channel', '/videos/1234']) {
+        const f = setup();
+        f.video.readyState = 4;
+        const api = qualityPlayer(f);
+        f.controller.start();
+        f.controller.setStatus({ hasAds: true });
+        api.player.setQuality(api.qualities[2]);
+        f.win.location.href = `https://www.twitch.tv${path}`;
+        f.win.emit('popstate');
+        f.video.emit('loadedmetadata');
+        assert.equal(api.manualCalls.length, 0);
+        assert.equal(api.player.setQuality, api.originalManual);
+        assert.equal(api.player.setAutoQualityMode, api.originalAuto);
+        assert.equal(f.controller.getDiagnostics().qualityLocked, false);
+        assert.deepEqual(api.autoCalls, [false, true], 'a cancelled block does not leave ABR disabled');
+        api.player.setQuality(api.qualities[1]);
+        assert.equal(api.manualCalls.length, 1);
+    }
+});
+
+test('quality restoration waits for a matching fresh rendition and accepts a newer choice meanwhile', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const api = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    api.player.setQuality(api.qualities[1]);
+    assert.equal(endAd(f), true);
+    api.qualities = [];
+    f.video.emit('loadedmetadata');
+    f.advance(1200);
+    assert.equal(api.manualCalls.length, 0);
+    assert.equal(api.state.calls, 1);
+    assert.equal(f.controller.getDiagnostics().qualityLocked, true);
+    api.player.setAutoQualityMode(true);
+    f.advance(600);
+    assert.deepEqual(api.autoCalls, [false, true]);
+    assert.equal(f.controller.getDiagnostics().qualityLocked, false);
+});
+
+test('source initialization cannot replace the last user quality choice', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const api = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    api.player.setQuality(api.qualities[1]);
+    api.state.setSrc = function () {
+        this.calls++;
+        api.player.setQuality(api.qualities[0]);
+        api.player.setAutoQualityMode(true);
+    };
+    assert.equal(endAd(f), true);
+    assert.equal(api.manualCalls.length, 1, 'initialization can configure its replacement decoder');
+    f.video.emit('loadedmetadata');
+    assert.equal(api.manualCalls.length, 2);
+    assert.equal(api.manualCalls[1].value, api.qualities[1], 'the menu choice still wins after initialization');
+    assert.equal(api.auto, false);
+});
+
+test('asynchronous source initialization keeps the last blocked quality choice until fresh metadata', async () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const api = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    api.player.setQuality(api.qualities[1]);
+    api.state.setSrc = function () {
+        this.calls++;
+        Promise.resolve().then(() => {
+            api.player.setQuality(api.qualities[0]);
+            api.player.setAutoQualityMode(true);
+        });
+    };
+    assert.equal(endAd(f), true);
+    await Promise.resolve();
+    assert.equal(api.manualCalls.length, 1, 'the asynchronous decoder initialization is not suppressed');
+    assert.equal(api.manualCalls[0].value, api.qualities[0]);
+    f.video.emit('playing');
+    assert.equal(api.manualCalls.length, 1, 'old buffered playback does not restore the pending choice');
+    api.qualities = api.qualities.map(item => ({ ...item }));
+    f.video.emit('loadedmetadata');
+    assert.equal(api.manualCalls.length, 2);
+    assert.equal(api.manualCalls[1].value, api.qualities[1], 'initialization cannot replace the menu choice captured during blocking');
+    assert.equal(api.auto, false);
+    f.video.emit('playing');
+    assert.equal(api.manualCalls.length, 2);
+});
+
+test('source initialization during a blocked ad cannot re-enable automatic rendition changes', () => {
+    const f = setup();
+    f.video.readyState = 4;
+    const api = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    api.player.setQuality(api.qualities[1]);
+    api.state.setSrc = function () {
+        this.calls++;
+        api.player.setAutoQualityMode(true);
+    };
+    assert.equal(f.controller.task({ reload: true, adRecovery: true }), true);
+    assert.equal(api.auto, false);
+    assert.deepEqual(api.autoCalls, [false, false]);
+    f.advance(8400);
+    assert.equal(endAd(f), true);
+    f.video.emit('loadedmetadata');
+    assert.equal(api.manualCalls[0].value, api.qualities[1]);
+});
+
+test('an unavailable recovered rendition expires after eight seconds without trapping quality controls', () => {
+    const f = setup({ debug: true });
+    f.video.readyState = 4;
+    const api = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    api.player.setQuality(api.qualities[1]);
+    assert.equal(endAd(f), true);
+    const remaining = api.qualities[0];
+    api.qualities = [remaining];
+    f.video.emit('loadedmetadata');
+    f.advance(7800);
+    assert.equal(f.controller.getDiagnostics().qualityLocked, true);
+    f.advance(600);
+    assert.equal(f.controller.getDiagnostics().qualityLocked, false);
+    assert.equal(api.manualCalls.length, 0);
+    assert.deepEqual(api.autoCalls, [false, true]);
+    assert.equal(api.state.calls, 1);
+    assert.ok(f.diagnostics.some(item => item.code === 'quality-restore-expired'));
+    api.player.setQuality(remaining);
+    assert.equal(api.manualCalls.length, 1, 'normal quality control is available again');
+});
+
+test('unverified video associations never receive quality API hooks', () => {
+    for (const mismatch of [true, false]) {
+        const f = setup();
+        const api = qualityPlayer(f);
+        if (mismatch) api.player.getHTMLVideoElement = () => new Video();
+        else delete api.player.getHTMLVideoElement;
+        f.controller.start();
+        f.controller.setStatus({ hasAds: true });
+        f.advance(2400);
+        assert.equal(api.player.setQuality, api.originalManual);
+        assert.equal(api.player.setAutoQualityMode, api.originalAuto);
+        assert.equal(api.autoCalls.length, 0);
+    }
+});
+
+test('stop preserves a later extension wrapper and makes its retained VAFT wrapper inert', () => {
+    const f = setup();
+    const api = qualityPlayer(f);
+    f.controller.start();
+    f.controller.setStatus({ hasAds: true });
+    const guarded = api.player.setQuality;
+    const extensionWrapper = function (...args) { return guarded.apply(this, args); };
+    api.player.setQuality = extensionWrapper;
+    f.controller.stop();
+    assert.equal(api.player.setQuality, extensionWrapper);
+    api.player.setQuality(api.qualities[1]);
+    assert.equal(api.manualCalls.length, 1);
+    assert.equal(f.timers.size, 0);
 });
 
 test('active and idle polling avoid DOM/React rescans on ordinary ticks', () => {

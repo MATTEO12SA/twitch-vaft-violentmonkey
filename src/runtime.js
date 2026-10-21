@@ -22,6 +22,9 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
     const workers = new Map();
     const credentials = new Map();
     const eventCounts = new Map();
+    // A clean side Worker or a startup error must not unlock an active ad period.
+    const adOwners = new Map();
+    let orphanedAfter = null;
     let serial = 0;
     let controller;
     let context = { kind: 'unknown', id: null, epoch: 0 };
@@ -32,7 +35,10 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
     let gqlSequence = 0;
     const allowedEvents = new Set(['module-worker-unsupported', 'worker-startup-error', 'worker-startup-timeout',
         'worker-terminated', 'vod-ad-observed', 'token-error', 'worker-hook-unavailable', 'fetch-hook-unavailable',
-        'player-context', 'player-ambiguous', 'player-error', 'player-reload', 'player-recovery', 'vod-waiting', 'vod-skip']);
+        'player-context', 'player-ambiguous', 'player-error', 'player-reload', 'player-recovery', 'vod-waiting', 'vod-skip',
+        'quality-unhook-failed', 'quality-auto-restore-failed', 'quality-choice-unrecognized',
+        'quality-hook-unavailable', 'quality-auto-freeze-failed', 'quality-choice-unavailable',
+        'quality-restore-unavailable', 'quality-restore-failed', 'quality-restore-expired']);
 
     function diagnostic(event) {
         const code = typeof event === 'string' ? event : event?.code;
@@ -66,6 +72,9 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
     }
 
     function detach(record) {
+        if (adOwners.delete(record.id) && !stopped) {
+            orphanedAfter = Math.max(orphanedAfter ?? 0, record.id);
+        }
         cancelRequests(record);
         revoke(record);
         record.worker.removeEventListener('message', record.onMessage);
@@ -75,11 +84,60 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
 
     function onContextChange(next) {
         if (stopped) return;
+        if (next.kind !== context.kind || next.id !== context.id) {
+            adOwners.clear();
+            orphanedAfter = null;
+            for (const record of workers.values()) record.adSession = record.closedAdSession = 0;
+        }
         context = { ...next };
         diagnostic('player-context');
         for (const record of workers.values()) {
             cancelRequests(record);
             post(record, 'context', { context });
+        }
+    }
+
+    function isBlocking() { return adOwners.size > 0 || orphanedAfter !== null; }
+
+    function reportWorkerError() {
+        const blocked = isBlocking();
+        controller.setStatus({ state: blocked ? 'waiting-ad' : 'error', hasAds: blocked, id: context.id, epoch: context.epoch });
+    }
+
+    function validPlaybackMessage(message) {
+        return context.kind === 'live' && message.channel === context.id &&
+            Number.isSafeInteger(message.adSession) && message.adSession >= 0;
+    }
+
+    function playbackStatus(record, message) {
+        if (!validPlaybackMessage(message)) return;
+        const wasBlocking = isBlocking();
+        if (message.hasAds === true) {
+            if (message.adSession <= record.closedAdSession || message.adSession < record.adSession) return;
+            record.adSession = message.adSession;
+            adOwners.set(record.id, message.adSession);
+            if (orphanedAfter !== null && record.id > orphanedAfter) orphanedAfter = null;
+            controller.setStatus({ state: message.state, hasAds: true, id: message.channel, epoch: message.epoch });
+            return;
+        }
+        if (message.hasAds !== false || message.clean !== true) return;
+        const ownsSession = adOwners.get(record.id) === message.adSession;
+        if (ownsSession && message.adEnded === true) {
+            adOwners.delete(record.id);
+            record.closedAdSession = message.adSession;
+        } else if (adOwners.has(record.id)) return;
+        // After termination, only a newer replacement may confirm clean media.
+        // An already-existing side Worker cannot end the orphaned ad period.
+        if (orphanedAfter !== null && record.id > orphanedAfter) orphanedAfter = null;
+        if (isBlocking()) return;
+        if (wasBlocking) {
+            const accepted = controller.setStatus({ state: 'resuming', hasAds: false, adEnded: true, deferQuality: true,
+                id: message.channel, epoch: message.epoch });
+            if (accepted !== false && message.epoch === context.epoch && message.channel === context.id) {
+                controller.task({ reload: true, adRecovery: true });
+            }
+        } else if (message.adSession === 0 && record.closedAdSession === 0) {
+            controller.setStatus({ state: message.state, hasAds: false, id: message.channel, epoch: message.epoch });
         }
     }
 
@@ -123,7 +181,8 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
     }
 
     function attach(worker, id, blobURL, sourceURL) {
-        const record = { worker, id, blobURL, sourceURL, requests: new Map(), timer: null, onMessage: null, onError: null };
+        const record = { worker, id, blobURL, sourceURL, requests: new Map(), timer: null, onMessage: null, onError: null,
+            adSession: 0, closedAdSession: 0 };
         record.onMessage = event => {
             const message = event.data;
             if (message?.namespace !== protocol || message.workerId !== id) return;
@@ -131,7 +190,7 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
             if (message.type === 'ready') { revoke(record); post(record, 'context', { context }); return; }
             if (message.type === 'startup-error') {
                 diagnostic('worker-startup-error');
-                controller.setStatus({ state: 'error', hasAds: false });
+                reportWorkerError();
                 detach(record);
                 return;
             }
@@ -139,15 +198,16 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
             if (message.type === 'token') void relayToken(record, message);
             else if (message.type === 'cancel-token' && Number.isSafeInteger(message.id)) record.requests.get(message.id)?.abort();
             else if (message.type === 'status' && ['playing', 'searching', 'waiting-ad', 'resuming', 'error'].includes(message.state)) {
-                controller.setStatus({ state: message.state, hasAds: message.hasAds === true });
-            } else if (message.type === 'reload' && context.kind === 'live') controller.task({ reload: true, adRecovery: true });
+                playbackStatus(record, message);
+            } else if (message.type === 'reload' && validPlaybackMessage(message) &&
+                adOwners.get(record.id) === message.adSession) controller.task({ reload: true, adRecovery: true });
             else if (message.type === 'vod-ranges' && Array.isArray(message.ranges) && message.ranges.length <= 1000) {
                 controller.setVodRanges({ id: message.id, epoch: message.epoch, ranges: message.ranges, timelineReliable: message.timelineReliable === true });
             } else if (message.type === 'diagnostic') diagnostic(message.code);
         };
         record.onError = () => {
             diagnostic('worker-startup-error');
-            controller.setStatus({ state: 'error', hasAds: false });
+            reportWorkerError();
             post(record, 'shutdown');
             detach(record);
         };
@@ -163,7 +223,7 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
         };
         record.timer = window.setTimeout(() => {
             diagnostic('worker-startup-timeout');
-            controller.setStatus({ state: 'error', hasAds: false });
+            reportWorkerError();
             post(record, 'shutdown');
             // Release the bootstrap resource on explicit startup failure, too.
             detach(record);
@@ -184,7 +244,7 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
         if (stopped || !isTwitchWorker(input)) return Reflect.construct(target, args, newTarget);
         if (options?.type === 'module') {
             diagnostic('module-worker-unsupported');
-            controller.setStatus({ state: 'error', hasAds: false });
+            reportWorkerError();
             return Reflect.construct(target, args, newTarget);
         }
         const id = ++serial;
@@ -202,7 +262,7 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
                 sourceURL = window.URL.createObjectURL(new window.Blob([request.responseText], { type: 'text/javascript' }));
             } catch {
                 diagnostic('worker-startup-error');
-                controller.setStatus({ state: 'error', hasAds: false });
+                reportWorkerError();
                 return Reflect.construct(target, args, newTarget);
             }
         }
@@ -287,6 +347,8 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
         controller?.stop();
         for (const record of workers.values()) detach(record);
         credentials.clear();
+        adOwners.clear();
+        orphanedAfter = null;
         window.removeEventListener('pagehide', onPageHide);
         window.removeEventListener('pageshow', onPageShow);
         if (window.fetch === wrappedFetch) window.fetch = originalFetch;
@@ -299,7 +361,8 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
     }
 
     function getDiagnostics() {
-        return { version: config.version, context: { ...context }, workers: workers.size,
+        return { version: config.version, context: { ...context }, workers: workers.size, adSessions: adOwners.size,
+            orphanedAdSession: orphanedAfter !== null,
             requests: Array.from(workers.values()).reduce((sum, record) => sum + record.requests.size, 0),
             blobURLs: Array.from(workers.values()).reduce((sum, record) => sum + Number(!!record.blobURL) + Number(!!record.sourceURL), 0),
             events: Object.fromEntries(eventCounts), player: controller?.getDiagnostics() };

@@ -2,14 +2,16 @@
 
 Userscript indépendant issu de [TwitchAdSolutions / vaft](https://github.com/pixeltris/TwitchAdSolutions), destiné à **Violentmonkey sur Chrome et Edge**, pour les directs de Twitch.
 
-## Version en préparation : 37.0.4
+## Version en préparation : 37.0.5
 
 Cette branche fiabilise les requêtes, les playlists et le cycle de vie du lecteur. **La validation en lecture réelle reste nécessaire avant fusion et distribution automatique.** Les tests automatisés utilisent des réponses simulées : ils ne démontrent pas que tous les formats publicitaires actuels de Twitch sont bloqués.
 
-Un premier essai par injection temporaire a permis de corriger un plantage au démarrage. Des essais ultérieurs dans Edge, après installation signalée par l’utilisateur, ont observé les interceptions de VAFT et TwitchNoSub, une reprise du direct et la lecture d’une VOD publique. Ils ont aussi montré un blocage à approfondir après changement de qualité/navigation. Ces essais portent sur la candidate 37.0.3 ; ils ne valident pas encore 37.0.4. Résultats et limites dans [TESTING.md](TESTING.md).
+Les essais Edge du 19 octobre ont confirmé une interruption temporaire après un choix de qualité, puis l’application de ce choix alors que « Pub bloquée » était encore affiché. L’utilisateur annonçait 37.0.4 installée, mais les octets et la version exécutés n’ont pas pu être certifiés. Le défaut complet « offline avec le son qui continue » n’a pas été reproduit et la fin du blocage n’a pas été observée. **37.0.5 prépare le report du changement de qualité ; ses essais réels seront effectués par l’utilisateur avant toute fusion.** Résultats et limites dans [TESTING.md](TESTING.md).
 
 - Les opérations GraphQL explicitement destinées au direct sont les seules réécrites. Les opérations VOD et inconnues restent intactes, y compris dans un lot mixte.
-- Une publicité confirmée déclenche la recherche d’un flux alternatif, y compris à basse résolution : priorité à une image sans publicité. Jusqu’à quatre variantes par profil sont sondées, deux à la fois ; les niveaux intermédiaires tournent entre les tentatives. Un secours lisible est conservé pendant la recherche d’une meilleure qualité, au plus toutes les 8 secondes et dans la limite du choix de l’utilisateur. Seuls des codecs compatibles sont substitués.
+- Une publicité confirmée déclenche la recherche d’un flux alternatif, y compris à basse résolution : priorité à une image sans publicité. Jusqu’à quatre variantes par profil sont sondées, deux à la fois ; les niveaux intermédiaires tournent entre les tentatives. Seuls des codecs compatibles sont substitués.
+- Pendant le blocage du direct, le flux de secours utilisable reste en place : aucune montée de qualité en arrière-plan et aucun changement immédiat à la suite d’un choix dans le menu. Le dernier choix manuel ou Auto est mémorisé, puis appliqué après confirmation de la fin du blocage et disponibilité du lecteur récupéré. Un secours devenu inutilisable peut encore être remplacé.
+- Le choix en attente suit un remplacement du lecteur sur la même chaîne. Un changement de chaîne ou le passage à une VOD l’abandonne ; la pause volontaire doit être conservée. Le comportement réel de ces transitions reste à valider.
 - L’indication publicitaire se limite à « Pub bloquée ». Si aucune alternative propre n’est accessible, une playlist d’attente sans segment publicitaire est renvoyée. Le script ne peut pas garantir que Twitch fournit toujours un flux sans publicité.
 - Les requêtes auxiliaires sont annulées après 8 secondes, corps compris. La recherche complète est également bornée à 8 secondes ; chaque sonde de variante libère sa place après 2 secondes au maximum pour permettre l’essai d’autres qualités. L’ordre des profils tourne après échec. Les nouvelles recherches sont espacées de 2, 4, 8, 16 puis 30 secondes ; les relances du lecteur sont séparées d’au moins 8 secondes.
 - Les VOD restent inchangées par défaut. Le diagnostic VOD est activable en mode debug ; le saut de plages publicitaires confirmées est **expérimental et désactivé par défaut**.
@@ -27,9 +29,9 @@ Le script reste distribué sous la forme d’un seul fichier, sans `@require` di
 
 Le nom **TwitchAD VAFT MATTEO12SA**, le `@namespace` et les URL de mise à jour sont conservés. La mise à jour de 37.0.2 vers cette version doit donc modifier l’entrée existante ; ce point figure dans les essais manuels. Les instructions ciblent Violentmonkey sans verrou technique contre les autres gestionnaires.
 
-`@updateURL` et `@downloadURL` continuent de viser **ce dépôt, branche main**. Un push sur une branche de développement n’est pas distribué aux utilisateurs de main.
+`@updateURL` et `@downloadURL` continuent de viser **ce dépôt, branche main**, qui distribue encore **37.0.2**. Un push sur une branche de développement n’est pas distribué aux utilisateurs de main.
 
-Pour essayer cette branche, remplacer temporairement le code de **l’entrée existante** dans l’éditeur Violentmonkey avec son `vaft.user.js` généré, puis recharger Twitch. Ne pas laisser deux copies activées. Les essais doivent suivre [TESTING.md](TESTING.md).
+Pour essayer cette branche, remplacer temporairement le code de **l’entrée existante** dans l’éditeur Violentmonkey avec son `vaft.user.js` généré, puis recharger Twitch. Si l’entrée a été renommée localement ou si un import crée une seconde entrée, ne conserver **qu’un seul VAFT actif**. TwitchNoSub reste installé séparément et peut rester actif pour les essais de coexistence. Les essais doivent suivre [TESTING.md](TESTING.md).
 
 ## Modifier et vérifier le code
 
@@ -74,7 +76,7 @@ VAFT n’enregistre pas les en-têtes d’authentification, jetons, signatures o
 
 ## Publication et retour arrière
 
-La référence Git `baseline-37.0.2` conserve la version de départ. La candidate 37.0.4 succède à 37.0.3 pour distinguer les nouvelles corrections dans les essais ; elle ne doit rejoindre `main` qu’après validation de [TESTING.md](TESTING.md). GitHub Actions vérifie la syntaxe, les métadonnées, le fichier généré et les tests sur Node 22 et 24.
+La référence Git `baseline-37.0.2` conserve la version de départ. La candidate 37.0.5 succède à 37.0.4 pour distinguer le correctif de qualité dans les essais ; elle ne doit rejoindre `main` qu’après validation de [TESTING.md](TESTING.md) et retour des essais de l’utilisateur. GitHub Actions vérifie la syntaxe, les métadonnées, le fichier généré et les tests sur Node 22 et 24.
 
 Pour annuler une version déjà distribuée, repartir du comportement validé, conserver le nom et le namespace et publier un numéro **supérieur** à la version retirée : un simple retour à un ancien numéro peut ne pas déclencher la mise à jour dans Violentmonkey.
 

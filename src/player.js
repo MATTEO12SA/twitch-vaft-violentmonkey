@@ -16,7 +16,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     // No unverified signatures: never hide Twitch's native error/anti-adblock UI.
     const verifiedOverlayRules = Object.freeze([]);
     const reservedRoutes = new Set(['directory', 'downloads', 'inventory', 'jobs', 'login', 'logout', 'search', 'settings', 'signup', 'subscriptions', 'turbo', 'videos', 'wallet', 'collections', 'p', 'friends', 'messages', 'moderator', 'dashboard']);
-    const videoEvents = ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'emptied', 'timeupdate', 'seeking', 'seeked'];
+    const videoEvents = ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'emptied', 'loadstart', 'timeupdate', 'seeking', 'seeked'];
     const metrics = { scans: 0, reactScans: 0, ticks: 0, tasks: 0, vodSkips: 0, contexts: 0, diagnostics: 0 };
     const diagnosticTimes = new Map();
     let running = false;
@@ -42,6 +42,178 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     let restore = null;
     let progress = { position: null, at: 0, started: false };
     let vod = { ranges: [], reliable: false, attempts: new Set(), position: null, pausedByUs: false, expectedSeek: null };
+    let quality = { locked: false, ending: false, recovery: null, mediaFence: null, readyAt: null, initial: null, pending: null, hook: null };
+
+    // Store only stable, public quality attributes. Objects returned by an old
+    // player/manifest must never be sent to a replacement player's decoder.
+    function qualityDescriptor(value) {
+        if (!value || typeof value !== 'object') return null;
+        const result = {};
+        for (const key of ['group', 'name', 'width', 'height', 'framerate', 'codecs']) {
+            if (typeof value[key] === 'string' || Number.isFinite(value[key])) result[key] = value[key];
+        }
+        return Object.keys(result).length ? result : null;
+    }
+
+    function removeQualityHook() {
+        const hook = quality.hook;
+        if (!hook) return;
+        for (const [name, record] of Object.entries(hook.methods)) {
+            // Another extension may have wrapped our wrapper in the meantime.
+            // Leave its method alone; our retired wrapper becomes a pass-through.
+            try {
+                if (hook.player[name] !== record.wrapper) continue;
+                if (record.descriptor) Object.defineProperty(hook.player, name, record.descriptor);
+                else delete hook.player[name];
+            } catch { diagnose('quality-unhook-failed'); }
+        }
+        hook.active = false;
+        quality.hook = null;
+    }
+
+    function resetQuality(restoreAuto = false) {
+        const hook = quality.hook;
+        if (restoreAuto && hook && quality.initial?.auto) {
+            try {
+                if (connected(video) && hook.player.getHTMLVideoElement() === video && hook.methods.setAutoQualityMode) {
+                    Reflect.apply(hook.methods.setAutoQualityMode.original, hook.player, [true]);
+                }
+            } catch { diagnose('quality-auto-restore-failed'); }
+        }
+        removeQualityHook();
+        quality = { locked: false, ending: false, recovery: null, mediaFence: null, readyAt: null, initial: null, pending: null, hook: null };
+    }
+
+    function hookIsCurrent(hook) {
+        if (!hook.active || !quality.locked || quality.hook !== hook || context.kind !== 'live' ||
+            !running || suspended || classify(pathname()).id !== context.id || !connected(video)) return false;
+        try { return hook.player.getHTMLVideoElement() === video; } catch { return false; }
+    }
+
+    function currentQualityChoice(player) {
+        try {
+            if (player.isAutoQualityMode?.() === true) return { auto: true };
+            const descriptor = qualityDescriptor(player.getQuality?.());
+            return descriptor ? { auto: false, descriptor } : null;
+        } catch { return null; }
+    }
+
+    function syncQualityGuard() {
+        if (!quality.locked || context.kind !== 'live' || !video) return;
+        const player = getPlayerAndState()?.player;
+        // Quality interception needs a verified association, not merely the only
+        // React candidate. Other scripts and mini-players keep their own APIs.
+        try {
+            if (!player || typeof player.getHTMLVideoElement !== 'function' || player.getHTMLVideoElement() !== video) return;
+        } catch { return; }
+        if (quality.hook?.player === player && quality.hook.active) return;
+        removeQualityHook();
+        if (!quality.initial) quality.initial = currentQualityChoice(player);
+        const hook = { player, methods: {}, active: true };
+        quality.hook = hook;
+        for (const name of ['setQuality', 'setAutoQualityMode']) {
+            if (typeof player[name] !== 'function') continue;
+            const original = player[name];
+            const descriptor = Object.getOwnPropertyDescriptor(player, name);
+            const wrapper = function (...args) {
+                if (!hookIsCurrent(hook) || this !== player) return Reflect.apply(original, this, args);
+                // Source recovery may initialize its decoder through these same
+                // setters. It is not a new menu choice and must not overwrite the
+                // user's request or prevent the replacement decoder from starting.
+                // setSrc may initialize asynchronously after its call returns.
+                // Until fresh media is observed, allow that initialization but
+                // retain the last menu choice recorded during the ad block.
+                if (internalAction || (quality.ending && quality.recovery === 'waiting-media')) {
+                    const initializationArgs = name === 'setAutoQualityMode' && !quality.ending && args[0] === true ? [false] : args;
+                    return Reflect.apply(original, this, initializationArgs);
+                }
+                if (name === 'setQuality') {
+                    const requested = qualityDescriptor(args[0]);
+                    if (requested) quality.pending = { auto: false, descriptor: requested };
+                    else diagnose('quality-choice-unrecognized');
+                } else if (args[0] === true) quality.pending = { auto: true };
+                else if (args[0] === false && !quality.pending?.descriptor) {
+                    try {
+                        const requested = qualityDescriptor(player.getQuality?.());
+                        if (requested) quality.pending = { auto: false, descriptor: requested };
+                    } catch { diagnose('quality-choice-unrecognized'); }
+                }
+                // SDK setters return void. In particular, do not forward a manual
+                // choice before the clean fallback and its decoder are released.
+                return undefined;
+            };
+            try {
+                Object.defineProperty(player, name, { configurable: true, writable: true, value: wrapper });
+                hook.methods[name] = { original, descriptor, wrapper };
+            } catch { diagnose('quality-hook-unavailable'); }
+        }
+        // ABR must not change the rendition underneath the pinned clean fallback.
+        // This does not issue setQuality or reset the source.
+        try {
+            if (player.isAutoQualityMode?.() === true && hook.methods.setAutoQualityMode) {
+                Reflect.apply(hook.methods.setAutoQualityMode.original, player, [false]);
+            }
+        } catch { diagnose('quality-auto-freeze-failed'); }
+    }
+
+    function resolveQuality(player, descriptor) {
+        let qualities;
+        try { qualities = player.getQualities?.(); } catch { return null; }
+        if (!Array.isArray(qualities)) return null;
+        // Group identifies the menu choice (including Source). Dimensions are a
+        // fallback when a refreshed manifest renames its variants.
+        for (const keys of [['group'], ['name', 'height', 'framerate'], ['width', 'height', 'framerate']]) {
+            if (keys.some(key => descriptor[key] === undefined || descriptor[key] === '')) continue;
+            const matches = qualities.filter(item => item && keys.every(key => item[key] === descriptor[key]));
+            if (matches.length === 1) return matches[0];
+        }
+        return null;
+    }
+
+    function finishQualityRecovery() {
+        if (!quality.locked || !quality.ending || quality.recovery !== 'ready' || !video ||
+            !(video.readyState > 0) || context.kind !== 'live') return false;
+        if (quality.readyAt !== null && now() - quality.readyAt >= 8000) {
+            // A vanished rendition must not leave the settings locked forever.
+            // Keep the recovered video and restore its previous Auto preference;
+            // never invent a substitute rendition or force another source reload.
+            diagnose('quality-restore-expired');
+            resetQuality(true);
+            return false;
+        }
+        syncQualityGuard();
+        const hook = quality.hook;
+        if (!hook || !hookIsCurrent(hook)) return false;
+        const choice = quality.pending || quality.initial;
+        let method;
+        let args;
+        if (choice?.auto) {
+            method = hook.methods.setAutoQualityMode?.original;
+            args = [true];
+        } else if (choice?.descriptor) {
+            const resolved = resolveQuality(hook.player, choice.descriptor);
+            if (!resolved) { diagnose('quality-choice-unavailable'); return false; }
+            method = hook.methods.setQuality?.original;
+            // Smooth switching is supported by the IVS SDK; use the fresh quality
+            // object and avoid throwing away already buffered content.
+            args = [resolved, true];
+        }
+        if (choice && !method) { diagnose('quality-restore-unavailable'); return false; }
+        const settings = { muted: video.muted, volume: video.volume, paused: intentionalPause || video.paused };
+        try {
+            if (method) Reflect.apply(method, hook.player, args);
+            resetQuality();
+            return true;
+        } catch { diagnose('quality-restore-failed'); return false; }
+        finally {
+            video.muted = settings.muted;
+            video.volume = settings.volume;
+            if (settings.paused && !video.paused) {
+                expectedPause = video;
+                video.pause();
+            }
+        }
+    }
 
     function diagnose(code) {
         metrics.diagnostics++;
@@ -76,12 +248,14 @@ function createPlayerController(env, options = {}, callbacks = {}) {
 
     function changeContext(next, mediaChanged) {
         if (!mediaChanged && next.kind === context.kind && next.id === context.id) return;
+        const sameLive = next.kind === 'live' && context.kind === 'live' && next.id === context.id;
+        if (!sameLive) resetQuality(true);
         context = { ...next, epoch: context.epoch + 1 };
         metrics.contexts++;
         resetVod();
         progress = { position: null, at: now(), started: false };
         reactCache = undefined;
-        status = { state: 'playing', hasAds: false, isMidroll: false };
+        if (!sameLive) status = { state: 'playing', hasAds: false, isMidroll: false };
         renderStatus();
         try { callbacks.onContextChange?.({ ...context }); } catch { diagnose('context-callback-failed'); }
     }
@@ -126,6 +300,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
 
     function bindVideo(nextVideo, preservePause = false) {
         if (video === nextVideo) return false;
+        removeQualityHook();
         const retainedPause = preservePause && intentionalPause;
         if (video) videoEvents.forEach(event => video.removeEventListener(event, onVideoEvent));
         video = nextVideo;
@@ -165,7 +340,10 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         }
         if (container !== nextContainer) { removeBanner(); container = nextContainer; }
         const nextRoute = pathname();
-        if (nextRoute !== route) restore = null;
+        if (nextRoute !== route) {
+            restore = null;
+            resetQuality(true);
+        }
         // Replacing the DOM video on one route is not a new request to play,
         // even if the old element disappears before its replacement arrives.
         const mediaChanged = bindVideo(nextVideo, nextRoute === route);
@@ -174,6 +352,15 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         changeContext(ambiguous ? { kind: 'unknown', id: null } : classify(route), mediaChanged);
         observeTarget();
         if (mediaChanged) applyRestore();
+        if (quality.locked) {
+            syncQualityGuard();
+            if (mediaChanged && video?.readyState > 0 && quality.ending && quality.recovery === 'waiting-media') {
+                quality.recovery = 'ready';
+                quality.readyAt = now();
+                quality.mediaFence = null;
+                if (!internalAction) finishQualityRecovery();
+            }
+        }
     }
 
     function refresh() {
@@ -237,11 +424,31 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         }
         if (event.type === 'seeked') vod.expectedSeek = null;
         if (event.type === 'loadedmetadata') applyRestore();
-        if (event.type === 'emptied') reactCache = undefined;
+        if (['loadedmetadata', 'emptied', 'loadstart'].includes(event.type)) reactCache = undefined;
+        if (quality.locked && ['loadedmetadata', 'playing', 'emptied', 'loadstart'].includes(event.type)) {
+            syncQualityGuard();
+            if (quality.ending && quality.recovery === 'waiting-media') {
+                if (event.type === 'emptied' || event.type === 'loadstart') {
+                    if (quality.mediaFence) quality.mediaFence.started = true;
+                }
+                // The old buffer can emit playing after an asynchronous setSrc.
+                // Only fresh metadata, a replacement element, or a playing event
+                // after an observed new-load boundary proves source recovery.
+                const freshMedia = event.type === 'loadedmetadata' ||
+                    (event.type === 'playing' && quality.mediaFence &&
+                        (quality.mediaFence.video !== video || quality.mediaFence.started));
+                if (freshMedia && video.readyState > 0) {
+                    quality.recovery = 'ready';
+                    quality.readyAt = now();
+                    quality.mediaFence = null;
+                }
+            }
+            if (!internalAction) finishQualityRecovery();
+        }
         if (event.type === 'timeupdate' || event.type === 'seeking' || event.type === 'seeked' || event.type === 'play') {
             checkVod();
         }
-        if (['play', 'pause', 'ended', 'loadedmetadata', 'emptied'].includes(event.type)) scheduleTick();
+        if (['play', 'pause', 'ended', 'loadedmetadata', 'emptied', 'loadstart'].includes(event.type)) scheduleTick();
     }
 
     function reactRoot() {
@@ -255,16 +462,32 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     function getPlayerAndState() {
         refresh();
         if (!video || !container) return null;
+        const currentRoot = reactRoot();
+        // An alternate commit can remount the component while its previous
+        // instance still points at this video. Rescan once for each observed root
+        // change; do not assume the cached component belongs to the current tree.
+        if (reactCache?.player && currentRoot !== reactCache.root) reactCache = undefined;
+        // Twitch can replace the SDK instance without replacing the DOM video.
+        // Validate the few captured component pointers before trusting a positive
+        // cache; an unchanged association needs no repeated React tree walk.
+        if (reactCache?.player && !reactCache.associations.every(({ component, instance, player }) => {
+            try {
+                return component.props?.mediaPlayerInstance === instance &&
+                    (instance.playerInstance || instance) === player &&
+                    (!player.getHTMLVideoElement || player.getHTMLVideoElement() === video);
+            } catch { return false; }
+        })) reactCache = undefined;
         // React may hydrate after the video appears. Retry incomplete associations
         // only when needed, at the recovery cadence, instead of on every tick.
         if (reactCache !== undefined && ((reactCache.player && reactCache.state) || now() < reactCacheRetryAt)) {
             return { ...reactCache, video, container };
         }
         metrics.reactScans++;
-        reactCacheRetryAt = now() + config.minReloadMs;
-        const stack = [reactRoot()].filter(Boolean);
+        reactCacheRetryAt = now() + (quality.locked ? Math.min(config.minReloadMs, config.idleIntervalMs) : config.minReloadMs);
+        const stack = [currentRoot].filter(Boolean);
         const seen = new Set();
         const players = new Set();
+        const associations = [];
         const states = new Set();
         while (stack.length && seen.size < 10000) {
             const node = stack.pop();
@@ -278,7 +501,10 @@ function createPlayerController(env, options = {}, callbacks = {}) {
                 const instance = component.props.mediaPlayerInstance;
                 const candidate = instance.playerInstance || instance;
                 try {
-                    if (!candidate.getHTMLVideoElement || candidate.getHTMLVideoElement() === video) players.add(candidate);
+                    if (!candidate.getHTMLVideoElement || candidate.getHTMLVideoElement() === video) {
+                        players.add(candidate);
+                        associations.push({ component, instance, player: candidate });
+                    }
                 } catch {}
             }
             if (typeof component.setSrc === 'function' && component.setInitialPlaybackSettings) states.add(component);
@@ -287,13 +513,18 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         // Refuse uncertain associations instead of commanding a second player.
         reactCache = {
             player: players.size === 1 ? [...players][0] : null,
-            state: players.size === 1 && states.size === 1 ? [...states][0] : null
+            state: players.size === 1 && states.size === 1 ? [...states][0] : null,
+            root: currentRoot,
+            associations
         };
         return { ...reactCache, video, container };
     }
 
     function task({ reload = false, pausePlay = false, adRecovery = false } = {}) {
         refresh();
+        // The end-of-ad reload is retained across pause, hydration and cooldown,
+        // but is never issued a second time while metadata is being awaited.
+        if (reload && adRecovery && quality.ending && quality.recovery !== 'reload-pending') return false;
         if (!running || suspended || !video || context.kind !== 'live' || video.ended || intentionalPause) return false;
         if (video.readyState > 0 || video.currentTime > 0) mediaWasLoaded = true;
         const startupRecovery = reload && adRecovery === true && !mediaWasLoaded && video.readyState === 0 && video.currentTime === 0;
@@ -309,6 +540,10 @@ function createPlayerController(env, options = {}, callbacks = {}) {
             internalAction = true;
             if (reload) {
                 restore = { ...settings, route, expires: now() + config.minReloadMs };
+                if (adRecovery && quality.ending) {
+                    quality.recovery = 'waiting-media';
+                    quality.mediaFence = { video, started: false };
+                }
                 current.state.setSrc({ isNewMediaPlayerInstance: true, refreshAccessToken: true });
                 video.muted = settings.muted;
                 video.volume = settings.volume;
@@ -325,10 +560,15 @@ function createPlayerController(env, options = {}, callbacks = {}) {
             return true;
         } catch {
             restore = null;
+            if (adRecovery && quality.ending) {
+                quality.recovery = 'reload-pending';
+                quality.mediaFence = null;
+            }
             diagnose('player-task-failed');
             return false;
         } finally {
             internalAction = false;
+            finishQualityRecovery();
         }
     }
 
@@ -409,6 +649,11 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         metrics.ticks++;
         refresh();
         checkVod();
+        if (quality.locked) {
+            syncQualityGuard();
+            if (quality.ending && quality.recovery === 'reload-pending') task({ reload: true, adRecovery: true });
+            finishQualityRecovery();
+        }
         if (video && context.kind === 'live' && !video.paused && !video.ended && !status.hasAds && status.state !== 'error') {
             const position = Number(video.currentTime);
             if (Number.isFinite(position)) {
@@ -429,6 +674,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     }
 
     function cleanupActive() {
+        resetQuality(true);
         if (pollTimer !== null) env.clearTimeout(pollTimer);
         if (mutationTimer !== null) env.clearTimeout(mutationTimer);
         pollTimer = mutationTimer = null;
@@ -490,7 +736,19 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         start, stop, task, getPlayerAndState,
         getContext() { return { ...context }; },
         setStatus(data = {}) {
+            refresh();
             if ((data.id !== undefined && String(data.id) !== context.id) || (data.epoch !== undefined && data.epoch !== context.epoch)) return false;
+            if (context.kind === 'live' && data.hasAds === true) {
+                quality.locked = true;
+                quality.ending = false;
+                quality.recovery = null;
+                quality.mediaFence = null;
+                quality.readyAt = null;
+                syncQualityGuard();
+            } else if (context.kind === 'live' && quality.locked && data.adEnded === true && data.hasAds === false && !quality.ending) {
+                quality.ending = true;
+                quality.recovery = 'reload-pending';
+            }
             status = { ...status, state: typeof data.state === 'string' ? data.state : status.state,
                 hasAds: typeof data.hasAds === 'boolean' ? data.hasAds : status.hasAds,
                 isMidroll: typeof data.isMidroll === 'boolean' ? data.isMidroll : status.isMidroll };
@@ -501,6 +759,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         getDiagnostics() {
             return { running, suspended, context: { ...context }, status: { ...status },
                 timerScheduled: pollTimer !== null, observerActive: !!observer, videoAttached: !!video,
+                qualityLocked: quality.locked, qualityPending: !!quality.pending, qualityRecovery: quality.recovery,
                 verifiedOverlayRules: verifiedOverlayRules.length, vodRanges: vod.ranges.length,
                 vodAttempts: vod.attempts.size, metrics: { ...metrics } };
         }

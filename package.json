@@ -1,6 +1,6 @@
 {
   "name": "twitch-vaft-violentmonkey",
-  "version": "37.0.4",
+  "version": "37.0.5",
   "private": true,
   "description": "Independent VAFT userscript with bounded recovery and VOD isolation",
   "license": "MIT",

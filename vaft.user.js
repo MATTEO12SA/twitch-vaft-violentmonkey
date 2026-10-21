@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TwitchAD VAFT MATTEO12SA
 // @namespace    https://github.com/MATTEO12SA/twitch-vaft-violentmonkey
-// @version      37.0.4
+// @version      37.0.5
 // @description  Multiple solutions for blocking Twitch ads (vaft)
 // @updateURL    https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js
 // @downloadURL  https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js
@@ -22,7 +22,7 @@
     if (window.top !== window.self || window.__VAFT_MATTEO_ACTIVE__) return;
     Object.defineProperty(window, '__VAFT_MATTEO_ACTIVE__', { value: true, configurable: true });
     const config = {
-    "version": "37.0.4",
+    "version": "37.0.5",
     "debug": false,
     "vodAdSkipping": false,
     "forcePlayerType": "popout",
@@ -579,7 +579,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     // No unverified signatures: never hide Twitch's native error/anti-adblock UI.
     const verifiedOverlayRules = Object.freeze([]);
     const reservedRoutes = new Set(['directory', 'downloads', 'inventory', 'jobs', 'login', 'logout', 'search', 'settings', 'signup', 'subscriptions', 'turbo', 'videos', 'wallet', 'collections', 'p', 'friends', 'messages', 'moderator', 'dashboard']);
-    const videoEvents = ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'emptied', 'timeupdate', 'seeking', 'seeked'];
+    const videoEvents = ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'emptied', 'loadstart', 'timeupdate', 'seeking', 'seeked'];
     const metrics = { scans: 0, reactScans: 0, ticks: 0, tasks: 0, vodSkips: 0, contexts: 0, diagnostics: 0 };
     const diagnosticTimes = new Map();
     let running = false;
@@ -605,6 +605,178 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     let restore = null;
     let progress = { position: null, at: 0, started: false };
     let vod = { ranges: [], reliable: false, attempts: new Set(), position: null, pausedByUs: false, expectedSeek: null };
+    let quality = { locked: false, ending: false, recovery: null, mediaFence: null, readyAt: null, initial: null, pending: null, hook: null };
+
+    // Store only stable, public quality attributes. Objects returned by an old
+    // player/manifest must never be sent to a replacement player's decoder.
+    function qualityDescriptor(value) {
+        if (!value || typeof value !== 'object') return null;
+        const result = {};
+        for (const key of ['group', 'name', 'width', 'height', 'framerate', 'codecs']) {
+            if (typeof value[key] === 'string' || Number.isFinite(value[key])) result[key] = value[key];
+        }
+        return Object.keys(result).length ? result : null;
+    }
+
+    function removeQualityHook() {
+        const hook = quality.hook;
+        if (!hook) return;
+        for (const [name, record] of Object.entries(hook.methods)) {
+            // Another extension may have wrapped our wrapper in the meantime.
+            // Leave its method alone; our retired wrapper becomes a pass-through.
+            try {
+                if (hook.player[name] !== record.wrapper) continue;
+                if (record.descriptor) Object.defineProperty(hook.player, name, record.descriptor);
+                else delete hook.player[name];
+            } catch { diagnose('quality-unhook-failed'); }
+        }
+        hook.active = false;
+        quality.hook = null;
+    }
+
+    function resetQuality(restoreAuto = false) {
+        const hook = quality.hook;
+        if (restoreAuto && hook && quality.initial?.auto) {
+            try {
+                if (connected(video) && hook.player.getHTMLVideoElement() === video && hook.methods.setAutoQualityMode) {
+                    Reflect.apply(hook.methods.setAutoQualityMode.original, hook.player, [true]);
+                }
+            } catch { diagnose('quality-auto-restore-failed'); }
+        }
+        removeQualityHook();
+        quality = { locked: false, ending: false, recovery: null, mediaFence: null, readyAt: null, initial: null, pending: null, hook: null };
+    }
+
+    function hookIsCurrent(hook) {
+        if (!hook.active || !quality.locked || quality.hook !== hook || context.kind !== 'live' ||
+            !running || suspended || classify(pathname()).id !== context.id || !connected(video)) return false;
+        try { return hook.player.getHTMLVideoElement() === video; } catch { return false; }
+    }
+
+    function currentQualityChoice(player) {
+        try {
+            if (player.isAutoQualityMode?.() === true) return { auto: true };
+            const descriptor = qualityDescriptor(player.getQuality?.());
+            return descriptor ? { auto: false, descriptor } : null;
+        } catch { return null; }
+    }
+
+    function syncQualityGuard() {
+        if (!quality.locked || context.kind !== 'live' || !video) return;
+        const player = getPlayerAndState()?.player;
+        // Quality interception needs a verified association, not merely the only
+        // React candidate. Other scripts and mini-players keep their own APIs.
+        try {
+            if (!player || typeof player.getHTMLVideoElement !== 'function' || player.getHTMLVideoElement() !== video) return;
+        } catch { return; }
+        if (quality.hook?.player === player && quality.hook.active) return;
+        removeQualityHook();
+        if (!quality.initial) quality.initial = currentQualityChoice(player);
+        const hook = { player, methods: {}, active: true };
+        quality.hook = hook;
+        for (const name of ['setQuality', 'setAutoQualityMode']) {
+            if (typeof player[name] !== 'function') continue;
+            const original = player[name];
+            const descriptor = Object.getOwnPropertyDescriptor(player, name);
+            const wrapper = function (...args) {
+                if (!hookIsCurrent(hook) || this !== player) return Reflect.apply(original, this, args);
+                // Source recovery may initialize its decoder through these same
+                // setters. It is not a new menu choice and must not overwrite the
+                // user's request or prevent the replacement decoder from starting.
+                // setSrc may initialize asynchronously after its call returns.
+                // Until fresh media is observed, allow that initialization but
+                // retain the last menu choice recorded during the ad block.
+                if (internalAction || (quality.ending && quality.recovery === 'waiting-media')) {
+                    const initializationArgs = name === 'setAutoQualityMode' && !quality.ending && args[0] === true ? [false] : args;
+                    return Reflect.apply(original, this, initializationArgs);
+                }
+                if (name === 'setQuality') {
+                    const requested = qualityDescriptor(args[0]);
+                    if (requested) quality.pending = { auto: false, descriptor: requested };
+                    else diagnose('quality-choice-unrecognized');
+                } else if (args[0] === true) quality.pending = { auto: true };
+                else if (args[0] === false && !quality.pending?.descriptor) {
+                    try {
+                        const requested = qualityDescriptor(player.getQuality?.());
+                        if (requested) quality.pending = { auto: false, descriptor: requested };
+                    } catch { diagnose('quality-choice-unrecognized'); }
+                }
+                // SDK setters return void. In particular, do not forward a manual
+                // choice before the clean fallback and its decoder are released.
+                return undefined;
+            };
+            try {
+                Object.defineProperty(player, name, { configurable: true, writable: true, value: wrapper });
+                hook.methods[name] = { original, descriptor, wrapper };
+            } catch { diagnose('quality-hook-unavailable'); }
+        }
+        // ABR must not change the rendition underneath the pinned clean fallback.
+        // This does not issue setQuality or reset the source.
+        try {
+            if (player.isAutoQualityMode?.() === true && hook.methods.setAutoQualityMode) {
+                Reflect.apply(hook.methods.setAutoQualityMode.original, player, [false]);
+            }
+        } catch { diagnose('quality-auto-freeze-failed'); }
+    }
+
+    function resolveQuality(player, descriptor) {
+        let qualities;
+        try { qualities = player.getQualities?.(); } catch { return null; }
+        if (!Array.isArray(qualities)) return null;
+        // Group identifies the menu choice (including Source). Dimensions are a
+        // fallback when a refreshed manifest renames its variants.
+        for (const keys of [['group'], ['name', 'height', 'framerate'], ['width', 'height', 'framerate']]) {
+            if (keys.some(key => descriptor[key] === undefined || descriptor[key] === '')) continue;
+            const matches = qualities.filter(item => item && keys.every(key => item[key] === descriptor[key]));
+            if (matches.length === 1) return matches[0];
+        }
+        return null;
+    }
+
+    function finishQualityRecovery() {
+        if (!quality.locked || !quality.ending || quality.recovery !== 'ready' || !video ||
+            !(video.readyState > 0) || context.kind !== 'live') return false;
+        if (quality.readyAt !== null && now() - quality.readyAt >= 8000) {
+            // A vanished rendition must not leave the settings locked forever.
+            // Keep the recovered video and restore its previous Auto preference;
+            // never invent a substitute rendition or force another source reload.
+            diagnose('quality-restore-expired');
+            resetQuality(true);
+            return false;
+        }
+        syncQualityGuard();
+        const hook = quality.hook;
+        if (!hook || !hookIsCurrent(hook)) return false;
+        const choice = quality.pending || quality.initial;
+        let method;
+        let args;
+        if (choice?.auto) {
+            method = hook.methods.setAutoQualityMode?.original;
+            args = [true];
+        } else if (choice?.descriptor) {
+            const resolved = resolveQuality(hook.player, choice.descriptor);
+            if (!resolved) { diagnose('quality-choice-unavailable'); return false; }
+            method = hook.methods.setQuality?.original;
+            // Smooth switching is supported by the IVS SDK; use the fresh quality
+            // object and avoid throwing away already buffered content.
+            args = [resolved, true];
+        }
+        if (choice && !method) { diagnose('quality-restore-unavailable'); return false; }
+        const settings = { muted: video.muted, volume: video.volume, paused: intentionalPause || video.paused };
+        try {
+            if (method) Reflect.apply(method, hook.player, args);
+            resetQuality();
+            return true;
+        } catch { diagnose('quality-restore-failed'); return false; }
+        finally {
+            video.muted = settings.muted;
+            video.volume = settings.volume;
+            if (settings.paused && !video.paused) {
+                expectedPause = video;
+                video.pause();
+            }
+        }
+    }
 
     function diagnose(code) {
         metrics.diagnostics++;
@@ -639,12 +811,14 @@ function createPlayerController(env, options = {}, callbacks = {}) {
 
     function changeContext(next, mediaChanged) {
         if (!mediaChanged && next.kind === context.kind && next.id === context.id) return;
+        const sameLive = next.kind === 'live' && context.kind === 'live' && next.id === context.id;
+        if (!sameLive) resetQuality(true);
         context = { ...next, epoch: context.epoch + 1 };
         metrics.contexts++;
         resetVod();
         progress = { position: null, at: now(), started: false };
         reactCache = undefined;
-        status = { state: 'playing', hasAds: false, isMidroll: false };
+        if (!sameLive) status = { state: 'playing', hasAds: false, isMidroll: false };
         renderStatus();
         try { callbacks.onContextChange?.({ ...context }); } catch { diagnose('context-callback-failed'); }
     }
@@ -689,6 +863,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
 
     function bindVideo(nextVideo, preservePause = false) {
         if (video === nextVideo) return false;
+        removeQualityHook();
         const retainedPause = preservePause && intentionalPause;
         if (video) videoEvents.forEach(event => video.removeEventListener(event, onVideoEvent));
         video = nextVideo;
@@ -728,7 +903,10 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         }
         if (container !== nextContainer) { removeBanner(); container = nextContainer; }
         const nextRoute = pathname();
-        if (nextRoute !== route) restore = null;
+        if (nextRoute !== route) {
+            restore = null;
+            resetQuality(true);
+        }
         // Replacing the DOM video on one route is not a new request to play,
         // even if the old element disappears before its replacement arrives.
         const mediaChanged = bindVideo(nextVideo, nextRoute === route);
@@ -737,6 +915,15 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         changeContext(ambiguous ? { kind: 'unknown', id: null } : classify(route), mediaChanged);
         observeTarget();
         if (mediaChanged) applyRestore();
+        if (quality.locked) {
+            syncQualityGuard();
+            if (mediaChanged && video?.readyState > 0 && quality.ending && quality.recovery === 'waiting-media') {
+                quality.recovery = 'ready';
+                quality.readyAt = now();
+                quality.mediaFence = null;
+                if (!internalAction) finishQualityRecovery();
+            }
+        }
     }
 
     function refresh() {
@@ -800,11 +987,31 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         }
         if (event.type === 'seeked') vod.expectedSeek = null;
         if (event.type === 'loadedmetadata') applyRestore();
-        if (event.type === 'emptied') reactCache = undefined;
+        if (['loadedmetadata', 'emptied', 'loadstart'].includes(event.type)) reactCache = undefined;
+        if (quality.locked && ['loadedmetadata', 'playing', 'emptied', 'loadstart'].includes(event.type)) {
+            syncQualityGuard();
+            if (quality.ending && quality.recovery === 'waiting-media') {
+                if (event.type === 'emptied' || event.type === 'loadstart') {
+                    if (quality.mediaFence) quality.mediaFence.started = true;
+                }
+                // The old buffer can emit playing after an asynchronous setSrc.
+                // Only fresh metadata, a replacement element, or a playing event
+                // after an observed new-load boundary proves source recovery.
+                const freshMedia = event.type === 'loadedmetadata' ||
+                    (event.type === 'playing' && quality.mediaFence &&
+                        (quality.mediaFence.video !== video || quality.mediaFence.started));
+                if (freshMedia && video.readyState > 0) {
+                    quality.recovery = 'ready';
+                    quality.readyAt = now();
+                    quality.mediaFence = null;
+                }
+            }
+            if (!internalAction) finishQualityRecovery();
+        }
         if (event.type === 'timeupdate' || event.type === 'seeking' || event.type === 'seeked' || event.type === 'play') {
             checkVod();
         }
-        if (['play', 'pause', 'ended', 'loadedmetadata', 'emptied'].includes(event.type)) scheduleTick();
+        if (['play', 'pause', 'ended', 'loadedmetadata', 'emptied', 'loadstart'].includes(event.type)) scheduleTick();
     }
 
     function reactRoot() {
@@ -818,16 +1025,32 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     function getPlayerAndState() {
         refresh();
         if (!video || !container) return null;
+        const currentRoot = reactRoot();
+        // An alternate commit can remount the component while its previous
+        // instance still points at this video. Rescan once for each observed root
+        // change; do not assume the cached component belongs to the current tree.
+        if (reactCache?.player && currentRoot !== reactCache.root) reactCache = undefined;
+        // Twitch can replace the SDK instance without replacing the DOM video.
+        // Validate the few captured component pointers before trusting a positive
+        // cache; an unchanged association needs no repeated React tree walk.
+        if (reactCache?.player && !reactCache.associations.every(({ component, instance, player }) => {
+            try {
+                return component.props?.mediaPlayerInstance === instance &&
+                    (instance.playerInstance || instance) === player &&
+                    (!player.getHTMLVideoElement || player.getHTMLVideoElement() === video);
+            } catch { return false; }
+        })) reactCache = undefined;
         // React may hydrate after the video appears. Retry incomplete associations
         // only when needed, at the recovery cadence, instead of on every tick.
         if (reactCache !== undefined && ((reactCache.player && reactCache.state) || now() < reactCacheRetryAt)) {
             return { ...reactCache, video, container };
         }
         metrics.reactScans++;
-        reactCacheRetryAt = now() + config.minReloadMs;
-        const stack = [reactRoot()].filter(Boolean);
+        reactCacheRetryAt = now() + (quality.locked ? Math.min(config.minReloadMs, config.idleIntervalMs) : config.minReloadMs);
+        const stack = [currentRoot].filter(Boolean);
         const seen = new Set();
         const players = new Set();
+        const associations = [];
         const states = new Set();
         while (stack.length && seen.size < 10000) {
             const node = stack.pop();
@@ -841,7 +1064,10 @@ function createPlayerController(env, options = {}, callbacks = {}) {
                 const instance = component.props.mediaPlayerInstance;
                 const candidate = instance.playerInstance || instance;
                 try {
-                    if (!candidate.getHTMLVideoElement || candidate.getHTMLVideoElement() === video) players.add(candidate);
+                    if (!candidate.getHTMLVideoElement || candidate.getHTMLVideoElement() === video) {
+                        players.add(candidate);
+                        associations.push({ component, instance, player: candidate });
+                    }
                 } catch {}
             }
             if (typeof component.setSrc === 'function' && component.setInitialPlaybackSettings) states.add(component);
@@ -850,13 +1076,18 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         // Refuse uncertain associations instead of commanding a second player.
         reactCache = {
             player: players.size === 1 ? [...players][0] : null,
-            state: players.size === 1 && states.size === 1 ? [...states][0] : null
+            state: players.size === 1 && states.size === 1 ? [...states][0] : null,
+            root: currentRoot,
+            associations
         };
         return { ...reactCache, video, container };
     }
 
     function task({ reload = false, pausePlay = false, adRecovery = false } = {}) {
         refresh();
+        // The end-of-ad reload is retained across pause, hydration and cooldown,
+        // but is never issued a second time while metadata is being awaited.
+        if (reload && adRecovery && quality.ending && quality.recovery !== 'reload-pending') return false;
         if (!running || suspended || !video || context.kind !== 'live' || video.ended || intentionalPause) return false;
         if (video.readyState > 0 || video.currentTime > 0) mediaWasLoaded = true;
         const startupRecovery = reload && adRecovery === true && !mediaWasLoaded && video.readyState === 0 && video.currentTime === 0;
@@ -872,6 +1103,10 @@ function createPlayerController(env, options = {}, callbacks = {}) {
             internalAction = true;
             if (reload) {
                 restore = { ...settings, route, expires: now() + config.minReloadMs };
+                if (adRecovery && quality.ending) {
+                    quality.recovery = 'waiting-media';
+                    quality.mediaFence = { video, started: false };
+                }
                 current.state.setSrc({ isNewMediaPlayerInstance: true, refreshAccessToken: true });
                 video.muted = settings.muted;
                 video.volume = settings.volume;
@@ -888,10 +1123,15 @@ function createPlayerController(env, options = {}, callbacks = {}) {
             return true;
         } catch {
             restore = null;
+            if (adRecovery && quality.ending) {
+                quality.recovery = 'reload-pending';
+                quality.mediaFence = null;
+            }
             diagnose('player-task-failed');
             return false;
         } finally {
             internalAction = false;
+            finishQualityRecovery();
         }
     }
 
@@ -972,6 +1212,11 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         metrics.ticks++;
         refresh();
         checkVod();
+        if (quality.locked) {
+            syncQualityGuard();
+            if (quality.ending && quality.recovery === 'reload-pending') task({ reload: true, adRecovery: true });
+            finishQualityRecovery();
+        }
         if (video && context.kind === 'live' && !video.paused && !video.ended && !status.hasAds && status.state !== 'error') {
             const position = Number(video.currentTime);
             if (Number.isFinite(position)) {
@@ -992,6 +1237,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
     }
 
     function cleanupActive() {
+        resetQuality(true);
         if (pollTimer !== null) env.clearTimeout(pollTimer);
         if (mutationTimer !== null) env.clearTimeout(mutationTimer);
         pollTimer = mutationTimer = null;
@@ -1053,7 +1299,19 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         start, stop, task, getPlayerAndState,
         getContext() { return { ...context }; },
         setStatus(data = {}) {
+            refresh();
             if ((data.id !== undefined && String(data.id) !== context.id) || (data.epoch !== undefined && data.epoch !== context.epoch)) return false;
+            if (context.kind === 'live' && data.hasAds === true) {
+                quality.locked = true;
+                quality.ending = false;
+                quality.recovery = null;
+                quality.mediaFence = null;
+                quality.readyAt = null;
+                syncQualityGuard();
+            } else if (context.kind === 'live' && quality.locked && data.adEnded === true && data.hasAds === false && !quality.ending) {
+                quality.ending = true;
+                quality.recovery = 'reload-pending';
+            }
             status = { ...status, state: typeof data.state === 'string' ? data.state : status.state,
                 hasAds: typeof data.hasAds === 'boolean' ? data.hasAds : status.hasAds,
                 isMidroll: typeof data.isMidroll === 'boolean' ? data.isMidroll : status.isMidroll };
@@ -1064,6 +1322,7 @@ function createPlayerController(env, options = {}, callbacks = {}) {
         getDiagnostics() {
             return { running, suspended, context: { ...context }, status: { ...status },
                 timerScheduled: pollTimer !== null, observerActive: !!observer, videoAttached: !!video,
+                qualityLocked: quality.locked, qualityPending: !!quality.pending, qualityRecovery: quality.recovery,
                 verifiedOverlayRules: verifiedOverlayRules.length, vodRanges: vod.ranges.length,
                 vodAttempts: vod.attempts.size, metrics: { ...metrics } };
         }
@@ -1078,6 +1337,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
     const protocol = 'vaft-matteo:1';
     let context = { ...initialContext };
     let serial = 0;
+    let adSerial = 0;
     let stopped = false;
     let simulateAds = false;
     const pending = new Map();
@@ -1086,7 +1346,6 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
     const blockedSegments = new Map();
     const controllers = new Set();
     const processedResponses = new WeakSet();
-    const qualityProbeIntervalMs = 8000;
     const variantProbeTimeoutMs = 2000;
     const candidateLimit = 4;
     const now = () => env.Date ? env.Date.now() : Date.now();
@@ -1098,6 +1357,23 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         const oldest = now() - config.cacheTtlMs;
         for (const [key, value] of map) if (value.at < oldest) map.delete(key);
         while (map.size > config.maxCacheEntries) map.delete(map.keys().next().value);
+    }
+
+    function removeStream(id, stream) {
+        env.clearTimeout(stream.retryTimer);
+        stream.searchController?.abort();
+        stream.refreshController?.abort();
+        stream.recoveryController?.abort();
+        streams.delete(id);
+        for (const [url, entry] of media) if (entry.stream === stream) media.delete(url);
+    }
+
+    function pruneStreams() {
+        const oldest = now() - config.cacheTtlMs;
+        for (const [id, stream] of streams) {
+            const current = context.kind === stream.kind && String(context.id).toLowerCase() === String(id).toLowerCase();
+            if (!current && (stream.at < oldest || streams.size > config.maxCacheEntries)) removeStream(id, stream);
+        }
     }
 
     function remember(map, key, value) {
@@ -1144,8 +1420,10 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             if (next.kind === stream.kind && String(next.id).toLowerCase() === String(id).toLowerCase()) {
                 stream.epoch = next.epoch;
                 stream.job = null;
-                stream.qualityJob = null;
-            } else streams.delete(id);
+                stream.recoveryController = null;
+                stream.refreshController = null;
+                stream.generation++;
+            } else removeStream(id, stream);
         }
         for (const [url, entry] of media) if (!streams.has(entry.stream.id)) media.delete(url);
         blockedSegments.clear();
@@ -1153,7 +1431,10 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         simulateAds = false;
         // An empty waiting manifest can stop native polling. Re-arm the retained
         // channel's recovery under the new epoch when its video/decoder changes.
-        for (const stream of streams.values()) if (stream.hadAds) scheduleRecovery(stream, stream.recoveryTarget);
+        for (const stream of streams.values()) if (stream.hadAds) {
+            status(stream, stream.state, true);
+            scheduleRecovery(stream, stream.recoveryTarget);
+        }
     }
 
     function onMessage(event) {
@@ -1179,21 +1460,62 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         if (!stream) {
             stream = { id, kind: kind.kind === 'live-master' ? 'live' : 'vod', url: url.href,
                 epoch, state: 'playing', attempt: 0, nextRetry: 0, job: null, backup: null,
-                qualityJob: null, qualityController: null,
-                hadAds: false, codecFallback: false, variants, retryTimer: null, recoveryTarget: null, generation: 0, at: now() };
+                adSession: 0, hadAds: false, codecFallback: false, variants, retryTimer: null, recoveryTarget: null, recoveryRevision: 0, generation: 0, at: now() };
             streams.set(id, stream);
         }
         stream.url = url.href;
+        // Signed media URLs can rotate without changing the chosen rendition.
+        // Rebind only an unambiguous exact rendition; a different quality cannot
+        // redefine what proves the end of this ad session.
+        const pinned = stream.recoveryTarget;
+        if (stream.hadAds && pinned && !variants.some(variant => variant.Url === pinned.Url)) {
+            const matches = variants.filter(variant => pinned.Codecs && pinned.Resolution &&
+                variant.Codecs === pinned.Codecs && variant.Resolution === pinned.Resolution && variant.FrameRate === pinned.FrameRate);
+            if (matches.length === 1) {
+                stream.recoveryTarget = matches[0];
+                stream.recoveryRevision++;
+                stream.recoveryController?.abort();
+                stream.recoveryController = null;
+                env.clearTimeout(stream.retryTimer);
+                stream.retryTimer = null;
+                scheduleRecovery(stream, stream.recoveryTarget);
+            }
+        }
         stream.variants = variants;
         stream.at = now();
         for (const variant of variants) remember(media, variant.Url, { stream, variant });
-        prune(streams);
+        pruneStreams();
         return stream;
     }
 
-    function status(stream, state, hasAds = stream.hadAds) {
+    function status(stream, state, hasAds = stream.hadAds, details = {}) {
         stream.state = state;
-        if (stream.epoch === context.epoch) send('status', { state, hasAds });
+        if (stream.epoch === context.epoch) send('status', {
+            state, hasAds, channel: stream.id,
+            adSession: hasAds || details.adEnded ? stream.adSession : 0, ...details
+        });
+    }
+
+    function reload(stream) {
+        send('reload', { channel: stream.id, adSession: stream.adSession, adEnded: !stream.hadAds });
+    }
+
+    function finishAd(stream) {
+        stream.generation++;
+        stream.searchController?.abort();
+        stream.recoveryController?.abort();
+        stream.refreshController?.abort();
+        env.clearTimeout(stream.retryTimer);
+        stream.retryTimer = null;
+        stream.hadAds = false;
+        stream.recoveryTarget = null;
+        stream.codecFallback = false;
+        stream.backup = null;
+        stream.job = null;
+        stream.attempt = 0;
+        stream.nextRetry = 0;
+        status(stream, 'resuming', false, { adEnded: true, clean: true });
+        reload(stream);
     }
 
     function codecFamily(codecs) {
@@ -1346,7 +1668,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                 // Do not splice incompatible codecs into a running decoder.
                 const compatible = compatibleVariants(variants, target);
                 const result = await probeVariants(chooseCandidates(compatible, target, stream.attempt), signal);
-                if (result) return { ...result, alternatives: compatible, qualityRound: 0, nextQualityProbe: now() + qualityProbeIntervalMs };
+                if (result) return result;
             } catch (failure) {
                 if (signal.aborted) throw failure;
             }
@@ -1357,7 +1679,6 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
     function beginSearch(stream, target) {
         if (stream.job) return stream.job;
         if (now() < stream.nextRetry) return Promise.resolve(null);
-        stream.qualityController?.abort();
         status(stream, 'searching', true);
         const controller = new env.AbortController();
         controllers.add(controller);
@@ -1389,85 +1710,57 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         return job;
     }
 
-    function improveQuality(stream, cached, target) {
-        if (stream.qualityJob || now() < cached.nextQualityProbe || !stream.hadAds) return;
-        const higher = (cached.alternatives || []).filter(variant => variantArea(variant) > variantArea(cached.variant));
-        const candidates = chooseCandidates(higher, target, cached.qualityRound++);
-        cached.nextQualityProbe = now() + qualityProbeIntervalMs;
-        if (!candidates.length) return;
-        const controller = new env.AbortController();
-        controllers.add(controller);
-        stream.qualityController = controller;
-        const timer = env.setTimeout(() => controller.abort(), config.requestTimeoutMs);
-        const epoch = context.epoch;
-        const generation = stream.generation;
-        const job = probeVariants(candidates, controller.signal).then(result => {
-            if (!result || controller.signal.aborted || epoch !== context.epoch || generation !== stream.generation ||
-                !stream.hadAds || stream.backup !== cached || variantArea(result.variant) <= variantArea(cached.variant) ||
-                !fitsTarget(result.variant, stream.recoveryTarget || target)) return;
-            stream.backup = { ...result, alternatives: cached.alternatives, qualityRound: 0, nextQualityProbe: now() + qualityProbeIntervalMs };
-        }).catch(() => {}).finally(() => {
-            env.clearTimeout(timer);
-            controllers.delete(controller);
-            if (stream.qualityController === controller) stream.qualityController = null;
-            if (stream.qualityJob === job) stream.qualityJob = null;
-        });
-        stream.qualityJob = job;
-    }
-
     function scheduleRecovery(stream, target) {
-        if (stream.retryTimer || !target?.Url || stopped || !stream.hadAds) return;
+        if (stream.retryTimer || stream.recoveryController || !target?.Url || stopped || !stream.hadAds) return;
         const epoch = context.epoch;
         const generation = stream.generation;
         stream.retryTimer = env.setTimeout(async () => {
             stream.retryTimer = null;
             if (epoch !== context.epoch || !liveChannel(stream.id) || !stream.hadAds) return;
             const currentTarget = stream.recoveryTarget || target;
+            const recoveryRevision = stream.recoveryRevision;
             const controller = new env.AbortController();
             controllers.add(controller);
+            stream.recoveryController = controller;
             try {
                 const text = await auxiliary(currentTarget.Url, controller.signal);
-                if (epoch !== context.epoch || generation !== stream.generation || !stream.hadAds) return;
+                if (epoch !== context.epoch || generation !== stream.generation || recoveryRevision !== stream.recoveryRevision || !stream.hadAds) return;
                 const inspection = hls.inspectMedia(text, currentTarget.Url);
-                if (!inspection.hasAds && !simulateAds) {
-                    stream.generation++;
-                    stream.searchController?.abort();
-                    stream.qualityController?.abort();
-                    stream.hadAds = false;
-                    stream.recoveryTarget = null;
-                    stream.codecFallback = false;
-                    stream.backup = null;
-                    stream.attempt = 0;
-                    stream.nextRetry = 0;
-                    status(stream, 'resuming', false);
-                    send('reload');
+                if (!inspection.hasAds && !simulateAds && inspection.segments.length) {
+                    finishAd(stream);
                     return;
                 }
                 const wasWaiting = stream.state !== 'playing';
                 const result = await backupText(stream, currentTarget);
-                if (epoch === context.epoch && result && wasWaiting) send('reload');
+                if (epoch === context.epoch && generation === stream.generation && result && wasWaiting) reload(stream);
             } catch {
-                if (epoch !== context.epoch || generation !== stream.generation) return;
+                if (epoch !== context.epoch || generation !== stream.generation || recoveryRevision !== stream.recoveryRevision) return;
                 const index = Math.min(stream.attempt++, config.retryDelaysMs.length - 1);
                 stream.nextRetry = now() + config.retryDelaysMs[index];
             } finally {
                 controllers.delete(controller);
-                if (epoch === context.epoch && generation === stream.generation && stream.hadAds) scheduleRecovery(stream, currentTarget);
+                if (stream.recoveryController === controller) stream.recoveryController = null;
+                if (epoch === context.epoch && generation === stream.generation && stream.hadAds) scheduleRecovery(stream, stream.recoveryTarget);
             }
         }, Math.max(config.retryDelaysMs[0], stream.nextRetry - now()));
     }
 
     async function backupText(stream, target) {
+        const epoch = context.epoch;
+        const generation = stream.generation;
+        const sameCodec = variant => !!codecFamily(target?.Codecs) && codecFamily(variant?.Codecs) === codecFamily(target.Codecs);
         const cached = stream.backup;
-        if (cached && fitsTarget(cached.variant, target)) {
-            improveQuality(stream, cached, target);
-            // Deduplicate simultaneous playlist requests; never replay a stale playlist indefinitely.
+        if (cached) {
+            // A stray request for another quality must not replace the working
+            // fallback. A different codec cannot be spliced into that decoder.
+            if (!sameCodec(cached.variant)) return null;
             if (now() - cached.at < 500) return cached.text;
             if (!stream.job) {
                 const controller = new env.AbortController();
                 controllers.add(controller);
+                stream.refreshController = controller;
                 const job = auxiliary(cached.url, controller.signal).then(text => {
-                    if (stream.epoch !== context.epoch) throw error('AbortError');
+                    if (epoch !== context.epoch || generation !== stream.generation || stream.backup !== cached) throw error('AbortError');
                     const inspection = hls.inspectMedia(text, cached.url);
                     if (inspection.hasAds || simulateAds || !inspection.segments.length) return null;
                     cached.text = absolutize(inspection.sanitizedText, cached.url);
@@ -1475,24 +1768,26 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
                     return cached;
                 }).catch(() => null).finally(() => {
                     controllers.delete(controller);
+                    if (stream.refreshController === controller) stream.refreshController = null;
                     if (stream.job === job) stream.job = null;
                 });
                 stream.job = job;
             }
             const refreshed = await stream.job;
-            // A background promotion may finish while this lower-quality poll is pending.
-            if (stream.backup !== cached && stream.backup && fitsTarget(stream.backup.variant, target)) return backupText(stream, target);
-            if (refreshed && fitsTarget(refreshed.variant, target)) return refreshed.text;
-            stream.qualityController?.abort();
-            stream.backup = null;
+            if (epoch !== context.epoch || generation !== stream.generation) throw error('AbortError');
+            if (refreshed && sameCodec(refreshed.variant)) return refreshed.text;
+            if (stream.backup === cached) stream.backup = null;
         }
-        const result = await beginSearch(stream, target);
-        // A concurrent request can target a different quality. Never serve it the wrong codec.
-        if (result && fitsTarget(result.variant, target)) return result.text;
-        return null;
+        // Preserve the initial resolution preference even if an in-flight
+        // request for a different quality arrives while the player is locked.
+        const pinned = stream.recoveryTarget;
+        const searchTarget = pinned && sameCodec(pinned) ? pinned : target;
+        const result = await beginSearch(stream, searchTarget);
+        if (epoch !== context.epoch || generation !== stream.generation) throw error('AbortError');
+        return result && sameCodec(result.variant) ? result.text : null;
     }
 
-    async function processMedia(stream, variant, url, text) {
+    async function processMedia(stream, variant, url, text, requestState) {
         const epoch = context.epoch;
         const inspection = hls.inspectMedia(text, url.href);
         if (stream.kind === 'vod') {
@@ -1503,39 +1798,41 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             return text; // Preserve VOD timeline and TwitchNoSub's response.
         }
         if (!liveChannel(stream.id)) return text;
-        if (!inspection.hasAds && !simulateAds) {
-            if (stream.hadAds) {
-                stream.generation++;
-                stream.searchController?.abort();
-                stream.qualityController?.abort();
-                env.clearTimeout(stream.retryTimer);
-                stream.retryTimer = null;
-                stream.hadAds = false;
-                stream.recoveryTarget = null;
-                stream.backup = null;
-                stream.nextRetry = 0;
-                stream.attempt = 0;
-                status(stream, 'resuming', false);
-                stream.codecFallback = false;
-                send('reload');
-            }
-            status(stream, 'playing', false);
+        const fresh = requestState.generation === stream.generation;
+        // Requests already in flight when this ad started may join its fallback,
+        // but can never end it. Results from an older completed ad are discarded.
+        if (!fresh && !(stream.hadAds && !requestState.hadAds && requestState.generation === stream.generation - 1)) {
+            throw error('AbortError');
+        }
+        const hasAds = inspection.hasAds || simulateAds;
+        if (!hasAds && !stream.hadAds) {
+            if (inspection.segments.length) status(stream, 'playing', false, { clean: true });
             return inspection.sanitizedText;
         }
-        stream.hadAds = true;
-        stream.recoveryTarget = variant;
+        if (!hasAds && fresh && inspection.segments.length && url.href === stream.recoveryTarget?.Url) {
+            finishAd(stream);
+            return inspection.sanitizedText;
+        }
+        if (!stream.hadAds) {
+            stream.hadAds = true;
+            stream.adSession = ++adSerial;
+            stream.generation++;
+            stream.recoveryTarget = variant;
+            // Lock the page player before any decoder replacement is requested.
+            status(stream, 'searching', true);
+        }
         const generation = stream.generation;
         for (const segment of inspection.segments) if (segment.isAd) remember(blockedSegments, segment.url, {});
         if (codecFamily(variant?.Codecs) === 'hevc' && !stream.codecFallback &&
             stream.variants.some(item => ['avc', 'av1'].includes(codecFamily(item.Codecs)))) {
             stream.codecFallback = true;
-            send('reload');
+            reload(stream);
         }
         const clean = await backupText(stream, variant);
         if (epoch !== context.epoch || generation !== stream.generation) throw error('AbortError');
+        scheduleRecovery(stream, stream.recoveryTarget);
         if (clean) return clean;
-        status(stream, 'waiting-ad', true);
-        scheduleRecovery(stream, variant);
+        if (!stream.backup) status(stream, 'waiting-ad', true);
         return waitingManifest(text);
     }
 
@@ -1551,6 +1848,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
         const known = media.get(url.href);
         const master = kind.kind === 'live-master' || kind.kind === 'vod-master';
         if (!master && !known) return fetcher(input, init);
+        const requestState = known ? { generation: known.stream.generation, hadAds: known.stream.hadAds } : null;
         const response = await fetcher(input, init);
         if (!response.ok) return response;
         if (processedResponses.has(response)) return response;
@@ -1574,7 +1872,7 @@ function createWorkerEngine(env, config, createNetworkTools, createHlsTools, ini
             const stream = registerMaster(url, text, kind, epoch);
             if (stream?.kind === 'live' && liveChannel(stream.id) && stream.codecFallback) changed = fallbackMaster(stream, text, url.href);
         } else {
-            const processing = processMedia(known.stream, known.variant, url, text);
+            const processing = processMedia(known.stream, known.variant, url, text, requestState);
             let onAbort;
             try {
                 const aborting = new Promise((resolve, reject) => {
@@ -1640,6 +1938,9 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
     const workers = new Map();
     const credentials = new Map();
     const eventCounts = new Map();
+    // A clean side Worker or a startup error must not unlock an active ad period.
+    const adOwners = new Map();
+    let orphanedAfter = null;
     let serial = 0;
     let controller;
     let context = { kind: 'unknown', id: null, epoch: 0 };
@@ -1650,7 +1951,10 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
     let gqlSequence = 0;
     const allowedEvents = new Set(['module-worker-unsupported', 'worker-startup-error', 'worker-startup-timeout',
         'worker-terminated', 'vod-ad-observed', 'token-error', 'worker-hook-unavailable', 'fetch-hook-unavailable',
-        'player-context', 'player-ambiguous', 'player-error', 'player-reload', 'player-recovery', 'vod-waiting', 'vod-skip']);
+        'player-context', 'player-ambiguous', 'player-error', 'player-reload', 'player-recovery', 'vod-waiting', 'vod-skip',
+        'quality-unhook-failed', 'quality-auto-restore-failed', 'quality-choice-unrecognized',
+        'quality-hook-unavailable', 'quality-auto-freeze-failed', 'quality-choice-unavailable',
+        'quality-restore-unavailable', 'quality-restore-failed', 'quality-restore-expired']);
 
     function diagnostic(event) {
         const code = typeof event === 'string' ? event : event?.code;
@@ -1684,6 +1988,9 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
     }
 
     function detach(record) {
+        if (adOwners.delete(record.id) && !stopped) {
+            orphanedAfter = Math.max(orphanedAfter ?? 0, record.id);
+        }
         cancelRequests(record);
         revoke(record);
         record.worker.removeEventListener('message', record.onMessage);
@@ -1693,11 +2000,60 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
 
     function onContextChange(next) {
         if (stopped) return;
+        if (next.kind !== context.kind || next.id !== context.id) {
+            adOwners.clear();
+            orphanedAfter = null;
+            for (const record of workers.values()) record.adSession = record.closedAdSession = 0;
+        }
         context = { ...next };
         diagnostic('player-context');
         for (const record of workers.values()) {
             cancelRequests(record);
             post(record, 'context', { context });
+        }
+    }
+
+    function isBlocking() { return adOwners.size > 0 || orphanedAfter !== null; }
+
+    function reportWorkerError() {
+        const blocked = isBlocking();
+        controller.setStatus({ state: blocked ? 'waiting-ad' : 'error', hasAds: blocked, id: context.id, epoch: context.epoch });
+    }
+
+    function validPlaybackMessage(message) {
+        return context.kind === 'live' && message.channel === context.id &&
+            Number.isSafeInteger(message.adSession) && message.adSession >= 0;
+    }
+
+    function playbackStatus(record, message) {
+        if (!validPlaybackMessage(message)) return;
+        const wasBlocking = isBlocking();
+        if (message.hasAds === true) {
+            if (message.adSession <= record.closedAdSession || message.adSession < record.adSession) return;
+            record.adSession = message.adSession;
+            adOwners.set(record.id, message.adSession);
+            if (orphanedAfter !== null && record.id > orphanedAfter) orphanedAfter = null;
+            controller.setStatus({ state: message.state, hasAds: true, id: message.channel, epoch: message.epoch });
+            return;
+        }
+        if (message.hasAds !== false || message.clean !== true) return;
+        const ownsSession = adOwners.get(record.id) === message.adSession;
+        if (ownsSession && message.adEnded === true) {
+            adOwners.delete(record.id);
+            record.closedAdSession = message.adSession;
+        } else if (adOwners.has(record.id)) return;
+        // After termination, only a newer replacement may confirm clean media.
+        // An already-existing side Worker cannot end the orphaned ad period.
+        if (orphanedAfter !== null && record.id > orphanedAfter) orphanedAfter = null;
+        if (isBlocking()) return;
+        if (wasBlocking) {
+            const accepted = controller.setStatus({ state: 'resuming', hasAds: false, adEnded: true, deferQuality: true,
+                id: message.channel, epoch: message.epoch });
+            if (accepted !== false && message.epoch === context.epoch && message.channel === context.id) {
+                controller.task({ reload: true, adRecovery: true });
+            }
+        } else if (message.adSession === 0 && record.closedAdSession === 0) {
+            controller.setStatus({ state: message.state, hasAds: false, id: message.channel, epoch: message.epoch });
         }
     }
 
@@ -1741,7 +2097,8 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
     }
 
     function attach(worker, id, blobURL, sourceURL) {
-        const record = { worker, id, blobURL, sourceURL, requests: new Map(), timer: null, onMessage: null, onError: null };
+        const record = { worker, id, blobURL, sourceURL, requests: new Map(), timer: null, onMessage: null, onError: null,
+            adSession: 0, closedAdSession: 0 };
         record.onMessage = event => {
             const message = event.data;
             if (message?.namespace !== protocol || message.workerId !== id) return;
@@ -1749,7 +2106,7 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
             if (message.type === 'ready') { revoke(record); post(record, 'context', { context }); return; }
             if (message.type === 'startup-error') {
                 diagnostic('worker-startup-error');
-                controller.setStatus({ state: 'error', hasAds: false });
+                reportWorkerError();
                 detach(record);
                 return;
             }
@@ -1757,15 +2114,16 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
             if (message.type === 'token') void relayToken(record, message);
             else if (message.type === 'cancel-token' && Number.isSafeInteger(message.id)) record.requests.get(message.id)?.abort();
             else if (message.type === 'status' && ['playing', 'searching', 'waiting-ad', 'resuming', 'error'].includes(message.state)) {
-                controller.setStatus({ state: message.state, hasAds: message.hasAds === true });
-            } else if (message.type === 'reload' && context.kind === 'live') controller.task({ reload: true, adRecovery: true });
+                playbackStatus(record, message);
+            } else if (message.type === 'reload' && validPlaybackMessage(message) &&
+                adOwners.get(record.id) === message.adSession) controller.task({ reload: true, adRecovery: true });
             else if (message.type === 'vod-ranges' && Array.isArray(message.ranges) && message.ranges.length <= 1000) {
                 controller.setVodRanges({ id: message.id, epoch: message.epoch, ranges: message.ranges, timelineReliable: message.timelineReliable === true });
             } else if (message.type === 'diagnostic') diagnostic(message.code);
         };
         record.onError = () => {
             diagnostic('worker-startup-error');
-            controller.setStatus({ state: 'error', hasAds: false });
+            reportWorkerError();
             post(record, 'shutdown');
             detach(record);
         };
@@ -1781,7 +2139,7 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
         };
         record.timer = window.setTimeout(() => {
             diagnostic('worker-startup-timeout');
-            controller.setStatus({ state: 'error', hasAds: false });
+            reportWorkerError();
             post(record, 'shutdown');
             // Release the bootstrap resource on explicit startup failure, too.
             detach(record);
@@ -1802,7 +2160,7 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
         if (stopped || !isTwitchWorker(input)) return Reflect.construct(target, args, newTarget);
         if (options?.type === 'module') {
             diagnostic('module-worker-unsupported');
-            controller.setStatus({ state: 'error', hasAds: false });
+            reportWorkerError();
             return Reflect.construct(target, args, newTarget);
         }
         const id = ++serial;
@@ -1820,7 +2178,7 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
                 sourceURL = window.URL.createObjectURL(new window.Blob([request.responseText], { type: 'text/javascript' }));
             } catch {
                 diagnostic('worker-startup-error');
-                controller.setStatus({ state: 'error', hasAds: false });
+                reportWorkerError();
                 return Reflect.construct(target, args, newTarget);
             }
         }
@@ -1905,6 +2263,8 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
         controller?.stop();
         for (const record of workers.values()) detach(record);
         credentials.clear();
+        adOwners.clear();
+        orphanedAfter = null;
         window.removeEventListener('pagehide', onPageHide);
         window.removeEventListener('pageshow', onPageShow);
         if (window.fetch === wrappedFetch) window.fetch = originalFetch;
@@ -1917,7 +2277,8 @@ function createVaftRuntime(env, config, createNetworkTools, createHlsTools, crea
     }
 
     function getDiagnostics() {
-        return { version: config.version, context: { ...context }, workers: workers.size,
+        return { version: config.version, context: { ...context }, workers: workers.size, adSessions: adOwners.size,
+            orphanedAdSession: orphanedAfter !== null,
             requests: Array.from(workers.values()).reduce((sum, record) => sum + record.requests.size, 0),
             blobURLs: Array.from(workers.values()).reduce((sum, record) => sum + Number(!!record.blobURL) + Number(!!record.sourceURL), 0),
             events: Object.fromEntries(eventCounts), player: controller?.getDiagnostics() };

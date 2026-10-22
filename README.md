@@ -2,11 +2,32 @@
 
 Base indépendante du script **TwitchAdSolutions (vaft)**, maintenue dans le dépôt **MATTEO12SA/twitch-vaft-violentmonkey** pour préparer de futures améliorations.
 
-## État de cette base
+## Candidate 37.0.6 — branche `test`
+
+**Version expérimentale, non validée.** La branche `main` distribue toujours la 37.0.2 pendant les essais. Cette candidate repart de cette base et contient deux changements :
+
+- Le bandeau existant affiche **« Pub bloquée »**, avec les mêmes conditions d'affichage.
+- Sur les pages `/videos/<identifiant>`, un ajout ciblé répond avec une liste JSON vide aux demandes publicitaires `GET` vers `https://edge.ads.twitch.tv/2018-01-01/3p/ads`. Les contextes ambigus sont laissés intacts. Les directs, playlists, qualités, Workers et le fonctionnement de TwitchNoSub ne sont pas modifiés.
+
+### Installer la candidate pour tes essais
+
+1. Ouvrir **[VAFT 37.0.6 depuis la branche test](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/test/vaft.user.js)** dans Violentmonkey.
+2. Remplacer l'entrée **TwitchAD VAFT MATTEO12SA** ; garder une seule version VAFT active et conserver TwitchNoSub actif.
+3. Recharger Twitch, puis essayer une rediffusion, ses qualités, la pause/reprise et le déplacement. Vérifier aussi un direct et une navigation direct → rediffusion → direct.
+
+Le nom, le namespace et les URL de mise à jour sont conservés. Ces URL continuent de pointer vers `main` : les prochaines candidates de `test` devront être installées manuellement. Pour revenir à la base, réinstaller manuellement le [fichier stable 37.0.2](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js) en remplacement de la candidate.
+
+### État de validation
+
+Les tests sont laissés à l'utilisateur à sa demande. Les tests automatisés ajoutés dans `test/vod-ads.test.cjs` **n'ont pas été exécutés** ; ils peuvent être lancés avec `node --test test/vod-ads.test.cjs` depuis une copie Git du dépôt avec Node.js 22 ou ultérieur.
+
+L'interception reste à vérifier sur un vrai pré-roll. Une absence fortuite de publicité ne prouve pas son efficacité. Les réponses locales XHR doivent également être acceptées par les restrictions du navigateur et par Twitch. Elles exposent une URL `data:` ; la réponse synthétique fetch n'a pas d'URL réseau. Aucun masquage d'erreur ni relancement forcé du lecteur n'est ajouté. La PR reste en brouillon jusqu'à validation.
+
+## Historique de la base 37.0.2
 
 - Basée sur la version **37.0.0** de [pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions), dont le dépôt est archivé depuis le 5 mars 2026.
-- Le fonctionnement du bloqueur et ses réglages d’origine sont conservés. **Aucune amélioration fonctionnelle n’est incluse à ce stade.**
-- Seules les métadonnées du userscript ont été adaptées : identifiant du projet (`@namespace`), adresses de mise à jour, page du projet, lien de signalement et version de distribution.
+- Dans cette base, le fonctionnement du bloqueur et ses réglages d’origine étaient conservés, sans amélioration fonctionnelle.
+- Seules les métadonnées du userscript avaient été adaptées : identifiant du projet (`@namespace`), adresses de mise à jour, page du projet, lien de signalement et version de distribution.
 - La version **37.0.2** affiche le nom **TwitchAD VAFT MATTEO12SA** dans Violentmonkey pour distinguer ce projet du script d’origine ; le fonctionnement reste inchangé.
 
 ## Installation avec Violentmonkey

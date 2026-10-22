@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TwitchAD VAFT MATTEO12SA
 // @namespace    https://github.com/MATTEO12SA/twitch-vaft-violentmonkey
-// @version      37.0.2
+// @version      37.0.6
 // @description  Multiple solutions for blocking Twitch ads (vaft)
 // @updateURL    https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js
 // @downloadURL  https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js
@@ -797,7 +797,7 @@
             }
             if (adBlockDiv != null) {
                 isActivelyStrippingAds = data.isStrippingAdSegments;
-                adBlockDiv.P.textContent = 'Blocking' + (data.isMidroll ? ' midroll' : '') + ' ads' + (data.isStrippingAdSegments ? ' (stripping)' : '');// + (data.numStrippedAdSegments > 0 ? ` (${data.numStrippedAdSegments})` : '');
+                adBlockDiv.P.textContent = 'Pub bloquée';// + (data.numStrippedAdSegments > 0 ? ` (${data.numStrippedAdSegments})` : '');
                 adBlockDiv.style.display = data.hasAds && playerBufferState.isLive ? 'block' : 'none';
             }
         }
@@ -996,6 +996,83 @@
             return realFetch.apply(this, arguments);
         };
     }
+    function hookVodAdRequests() {
+        // VOD ads use a separate request. Never feed VOD segments into the live filter.
+        const emptyAdResponse = '[]';
+        const localAdResponseUrl = 'data:application/json,%5B%5D';
+        function isVodAdRequest(input, method) {
+            try {
+                if (String(method).toUpperCase() !== 'GET') {
+                    return false;
+                }
+                const url = new URL(input instanceof Request ? input.url : input, document.location.href);
+                if (url.origin !== 'https://edge.ads.twitch.tv' || url.pathname !== '/2018-01-01/3p/ads' || url.username || url.password) {
+                    return false;
+                }
+                const page = document.location;
+                if (window.top !== window.self || page.protocol !== 'https:' || (page.hostname !== 'www.twitch.tv' && page.hostname !== 'twitch.tv')) {
+                    return false;
+                }
+                const vodId = page.pathname.match(/^\/videos\/(\d+)\/?$/)?.[1];
+                if (!vodId || document.querySelectorAll('.video-player').length > 1) {
+                    return false;
+                }
+                // Check fresh state only for the targeted request, including SPA transitions.
+                // An initial VOD request can precede creation of the player.
+                const content = getPlayerAndState()?.state?.props?.content;
+                if (content?.type === 'live') {
+                    return false;
+                }
+                if (content?.type && content.type !== 'vod' && content.type !== 'video') {
+                    return false;
+                }
+                if (content?.id != null && String(content.id).replace(/^v/, '') !== vodId) {
+                    return false;
+                }
+                return true;
+            } catch {
+                // An unknown URL or player context must not interfere with playback.
+                return false;
+            }
+        }
+        const previousFetch = window.fetch;
+        window.fetch = function(input, init) {
+            if (!isVodAdRequest(input, 'GET')) {
+                return previousFetch.apply(this, arguments);
+            }
+            try {
+                const method = init?.method !== undefined ? init.method : (input instanceof Request ? input.method : 'GET');
+                if (String(method).toUpperCase() !== 'GET') {
+                    return previousFetch.apply(this, arguments);
+                }
+                // Validate only this small GET; do not consume or clone unrelated bodies.
+                const request = new Request(input instanceof Request ? input : new URL(input, document.location.href), init);
+                return Promise.resolve().then(() => {
+                    if (request.signal.aborted) {
+                        throw request.signal.reason;
+                    }
+                    return new Response(emptyAdResponse, {
+                        status: 200,
+                        statusText: 'OK',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                });
+            } catch (error) {
+                return Promise.reject(error);
+            }
+        };
+        const previousOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            // Decide anew on every open: no per-instance flag can leak to a later request.
+            if (!isVodAdRequest(url, method)) {
+                return previousOpen.apply(this, arguments);
+            }
+            const args = Array.from(arguments);
+            args[1] = localAdResponseUrl;
+            return previousOpen.apply(this, args);
+        };
+        // Headers, send/abort, async, timeout, responseType and events remain native.
+    }
     function onContentLoaded() {
         // This stops Twitch from pausing the player when in another tab and an ad shows.
         // Taken from https://github.com/saucettv/VideoAdBlockForTwitch/blob/cefce9d2b565769c77e3666ac8234c3acfe20d83/chrome/content.js#L30
@@ -1098,6 +1175,7 @@
     declareOptions(window);
     hookWindowWorker();
     hookFetch();
+    hookVodAdRequests();
     if (PlayerBufferingFix) {
         monitorPlayerBuffering();
     }

@@ -30,9 +30,6 @@ Sur les VOD concernées, le lecteur reçoit une réponse sans annonce et peut d�
 
 Si cette entrée existe déjà, la mettre à jour ou la remplacer. Une installation de TwitchAdSolutions portant un autre nom reste distincte : désactivez-la pour éviter les doublons. Les instructions ciblent Violentmonkey ; aucun verrou contre les autres gestionnaires n'est ajouté.
 
-### Vous utilisiez le complément de test VOD ?
-
-Après avoir installé **VAFT 37.0.4**, désactivez ou supprimez **TwitchAD VOD VAST - test MATTEO12SA**, puis rechargez Twitch. Son traitement est désormais intégré au script principal. Une protection commune évite de l'installer deux fois si le complément reste temporairement actif. Gardez TwitchNoSub actif si nécessaire.
 
 ## Mises à jour
 

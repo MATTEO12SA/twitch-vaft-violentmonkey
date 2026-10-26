@@ -1,34 +1,55 @@
 # TwitchAD VAFT MATTEO12SA
 
-Version personnalisée du script **TwitchAdSolutions (vaft)** pour une installation avec **Violentmonkey**, avec des mises à jour distribuées depuis le dépôt **MATTEO12SA/twitch-vaft-violentmonkey**.
+**VAFT pour les directs Twitch, avec un ajout pour bloquer les publicités avant les rediffusions.**
 
-## Version actuelle : 37.0.3
+Ce projet indépendant reprend le moteur VAFT de TwitchAdSolutions et ajoute le blocage des **pré-rolls VOD VAST 3 pris en charge**. Il s'installe avec **Violentmonkey** et reçoit ses mises à jour depuis ce dépôt.
 
-- Basée sur la version **37.0.0** de [pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions), dont le dépôt est archivé depuis le 5 mars 2026.
-- Le fonctionnement du bloqueur et ses réglages d’origine sont conservés.
-- Le nom **TwitchAD VAFT MATTEO12SA** permet de distinguer ce projet dans Violentmonkey. Son identifiant (`@namespace`), ses liens de support et ses adresses de mise à jour correspondent à ce dépôt.
-- La **37.0.3** traduit uniquement le texte du bandeau publicitaire en **« Pub bloquée »** par rapport à la 37.0.2. Ses conditions d’affichage restent identiques.
+**[Installer ou mettre à jour le script](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js)** · [Nouveautés](CHANGELOG.md) · [Signaler un problème](https://github.com/MATTEO12SA/twitch-vaft-violentmonkey/issues)
 
-## Installation avec Violentmonkey
+## Ce qu'apporte la version 37.0.4
+
+Le [projet d'origine](https://github.com/pixeltris/TwitchAdSolutions) est archivé. Ce dépôt poursuit une évolution indépendante : la 37.0.4 intègre le traitement VOD validé séparément, tout en conservant le code existant des directs.
+
+| Fonction | Prise en charge |
+| --- | --- |
+| Publicités des directs | Moteur VAFT conservé, avec le bandeau « Pub bloquée ». |
+| Publicités avant une rediffusion | Blocage du format VAST 3 identifié, sans restriction de chaîne ou d'annonceur. |
+| Publicités en cours de rediffusion | Pas de prise en charge ajoutée dans cette version. |
+| Bannières et autres formats | Hors du périmètre de cet ajout. |
+
+Sur les VOD concernées, le lecteur reçoit une réponse sans annonce et peut démarrer normalement. **Aucun bandeau « Pub bloquée » n'est affiché sur les VOD.** Le ciblage est volontairement précis : cette version ne garantit pas l'absence de toute publicité dans tous les cas.
+
+**TwitchNoSub reste distinct.** Conservez-le si votre lecture des rediffusions en dépend ; il n'est ni inclus ni remplacé par VAFT.
+
+## Installation
 
 1. Installer [Violentmonkey](https://violentmonkey.github.io/get-it/).
-2. Si un autre script VAFT ou TwitchAdSolutions est actif, le désactiver pour ne garder qu’une seule version active.
-3. Ouvrir **[Installer VAFT depuis ce dépôt](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js)**, puis confirmer dans Violentmonkey.
-4. Si l’entrée **TwitchAD VAFT MATTEO12SA** existe déjà, choisir sa mise à jour ou son remplacement.
-5. Recharger les onglets Twitch pour utiliser le script installé.
+2. Désactiver les autres scripts VAFT ou TwitchAdSolutions pour ne garder qu'une version active.
+3. Ouvrir **[le fichier installable](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js)** et confirmer l'installation dans Violentmonkey. Si le navigateur affiche uniquement le code, enregistrer le fichier `vaft.user.js` puis l'importer dans Violentmonkey.
+4. Vérifier l'entrée **TwitchAD VAFT MATTEO12SA**, version **37.0.4**, puis recharger les onglets Twitch.
 
-Le nom affiché et le `@namespace` sont propres à ce projet. Si vous aviez installé une version portant l’ancien nom, désactivez-la ou supprimez-la, puis installez la version renommée via ce lien pour éviter les doublons. Les instructions sont destinées à **Violentmonkey** ; aucun verrou contre les autres gestionnaires n’a été ajouté.
+Si cette entrée existe déjà, la mettre à jour ou la remplacer. Une installation de TwitchAdSolutions portant un autre nom reste distincte : désactivez-la pour éviter les doublons. Les instructions ciblent Violentmonkey ; aucun verrou contre les autres gestionnaires n'est ajouté.
 
-## Mises à jour de ce projet
+### Vous utilisiez le complément de test VOD ?
 
-`@updateURL` et `@downloadURL` pointent tous deux vers [notre fichier `vaft.user.js`](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js), sur la branche **`main`**. Les mises à jour proviennent donc de **ce dépôt GitHub**.
+Après avoir installé **VAFT 37.0.4**, désactivez ou supprimez **TwitchAD VOD VAST - test MATTEO12SA**, puis rechargez Twitch. Son traitement est désormais intégré au script principal. Une protection commune évite de l'installer deux fois si le complément reste temporairement actif. Gardez TwitchNoSub actif si nécessaire.
 
-Pour recevoir les nouvelles versions automatiquement, laisser les mises à jour activées dans Violentmonkey, y compris pour ce script. Le gestionnaire recherche périodiquement une version dont le numéro `@version` est supérieur à celui installé : une publication sur GitHub n’est donc pas nécessairement installée immédiatement. Après une mise à jour, recharger les onglets Twitch.
+## Mises à jour
 
-Pour publier une future évolution du script, modifier `vaft.user.js` sur `main` et augmenter `@version`. Conserver son nom et son `@namespace` pour que Violentmonkey reconnaisse la même entrée. Les références au projet d’origine servent à conserver la provenance et les crédits.
+Le script conserve son nom et son identifiant afin de mettre à jour la même entrée. Ses adresses `@updateURL` et `@downloadURL` pointent vers [le fichier de la branche `main`](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js) de **ce dépôt**, indépendamment du dépôt archivé.
 
-## Crédits et licence
+Laissez les mises à jour automatiques activées dans Violentmonkey. Le gestionnaire recherche périodiquement une version supérieure : une publication sur GitHub n'est pas nécessairement installée immédiatement. Vous pouvez aussi utiliser le lien d'installation ci-dessus pour mettre à jour manuellement. Rechargez Twitch après une mise à jour.
 
-Code d’origine : [TwitchAdSolutions et ses contributeurs](https://github.com/pixeltris/TwitchAdSolutions), avec les [crédits de VideoAdBlockForTwitch](https://github.com/cleanlock/VideoAdBlockForTwitch#credits) conservés dans le script.
+## Validation et contributions
 
-La [licence MIT d’origine](LICENSE) est conservée. Ce projet est indépendant de Twitch et de Violentmonkey.
+Le module VOD a été testé séparément sous **Edge avec Violentmonkey et TwitchNoSub** : les essais répétés ont montré une publicité lorsqu'il était désactivé, puis son absence lorsqu'il était activé. Les captures réseau ont confirmé une réponse locale XML sans annonce et l'accès à la rediffusion.
+
+Les tests automatisés utilisent des requêtes fictives pour vérifier le ciblage et le comportement réseau. Ils complètent ces observations sans valider tous les formats publicitaires de Twitch. Les commandes, les limites et les scénarios de vérification sont décrits dans [TESTING.md](TESTING.md).
+
+Pour signaler un problème, indiquez la version du script, le navigateur, les autres scripts actifs et les étapes permettant de le reproduire. Ne publiez pas de cookies, de jetons de connexion ni d'export réseau contenant ces données. Les améliorations passent par une PR, des tests et une nouvelle version avant publication sur `main`.
+
+## Origine et licence
+
+Ce projet reprend le travail de [TwitchAdSolutions et de ses contributeurs](https://github.com/pixeltris/TwitchAdSolutions). Les [crédits de VideoAdBlockForTwitch](https://github.com/cleanlock/VideoAdBlockForTwitch#credits) et la [licence MIT d'origine](LICENSE) sont conservés.
+
+Le traitement VOD et les publications de ce dépôt sont propres à **TwitchAD VAFT MATTEO12SA**. Le projet est indépendant de Twitch et de Violentmonkey.

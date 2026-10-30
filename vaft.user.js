@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TwitchAD VAFT MATTEO12SA
-// @namespace    https://github.com/MATTEO12SA/Twitch-Ad-Block-Directs-VOD
-// @version      37.0.4
+// @namespace    https://github.com/MATTEO12SA/twitch-vaft-violentmonkey
+// @version      37.0.5
 // @description  Bloque les publicités Twitch en direct avec VAFT et les pré-rolls VOD VAST pris en charge.
 // @updateURL    https://raw.githubusercontent.com/MATTEO12SA/Twitch-Ad-Block-Directs-VOD/main/vaft.user.js
 // @downloadURL  https://raw.githubusercontent.com/MATTEO12SA/Twitch-Ad-Block-Directs-VOD/main/vaft.user.js

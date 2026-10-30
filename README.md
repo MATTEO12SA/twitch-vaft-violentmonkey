@@ -1,6 +1,6 @@
 # Twitch Ad Block — Directs & VOD
 
-**Par MATTEO12SA · Pour Violentmonkey · Version 37.0.4**
+**Par MATTEO12SA · Pour Violentmonkey · Version 37.0.5**
 
 Un userscript pour bloquer les publicités des directs Twitch avec VAFT et certains pré-rolls avant les rediffusions.
 

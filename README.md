@@ -1,14 +1,14 @@
-# TwitchAD VAFT MATTEO12SA
+# Twitch Ad Block — MATTEO12SA
 
-**VAFT pour les directs Twitch, avec un ajout pour bloquer les publicités avant les rediffusions.**
+**Bloqueur de publicités Twitch pour Violentmonkey : directs avec VAFT et pré-rolls VOD pris en charge.**
 
-Ce projet indépendant reprend le moteur VAFT de TwitchAdSolutions et ajoute le blocage des **pré-rolls VOD VAST 3 pris en charge**. Il s'installe avec **Violentmonkey** et reçoit ses mises à jour depuis ce dépôt.
+**Twitch Ad Block — MATTEO12SA** est un userscript indépendant qui associe le moteur VAFT pour les directs au blocage de certains **pré-rolls VOD au format VAST 3**. Il s'installe avec **Violentmonkey** et reçoit ses mises à jour depuis ce dépôt.
 
 **[Installer ou mettre à jour le script](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js)** · [Nouveautés](CHANGELOG.md) · [Signaler un problème](https://github.com/MATTEO12SA/twitch-vaft-violentmonkey/issues)
 
-## Ce qu'apporte la version 37.0.4
+## Fonctionnalités — version 37.0.4
 
-Le [projet d'origine](https://github.com/pixeltris/TwitchAdSolutions) est archivé. Ce dépôt poursuit une évolution indépendante : la 37.0.4 intègre le traitement VOD validé séparément, tout en conservant le code existant des directs.
+La version 37.0.4 réunit le blocage des publicités en direct et le traitement VOD validé séparément sous Edge avec Violentmonkey et TwitchNoSub.
 
 | Fonction | Prise en charge |
 | --- | --- |
@@ -28,12 +28,11 @@ Sur les VOD concernées, le lecteur reçoit une réponse sans annonce et peut d�
 3. Ouvrir **[le fichier installable](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js)** et confirmer l'installation dans Violentmonkey. Si le navigateur affiche uniquement le code, enregistrer le fichier `vaft.user.js` puis l'importer dans Violentmonkey.
 4. Vérifier l'entrée **TwitchAD VAFT MATTEO12SA**, version **37.0.4**, puis recharger les onglets Twitch.
 
-Si cette entrée existe déjà, la mettre à jour ou la remplacer. Une installation de TwitchAdSolutions portant un autre nom reste distincte : désactivez-la pour éviter les doublons. Les instructions ciblent Violentmonkey ; aucun verrou contre les autres gestionnaires n'est ajouté.
-
+Dans Violentmonkey, le nom d'installation reste **TwitchAD VAFT MATTEO12SA** pour conserver la même entrée lors des mises à jour. Si cette entrée existe déjà, la mettre à jour ou la remplacer. Une installation de TwitchAdSolutions portant un autre nom reste distincte : désactivez-la pour éviter les doublons. Les instructions ciblent Violentmonkey ; aucun verrou contre les autres gestionnaires n'est ajouté.
 
 ## Mises à jour
 
-Le script conserve son nom et son identifiant afin de mettre à jour la même entrée. Ses adresses `@updateURL` et `@downloadURL` pointent vers [le fichier de la branche `main`](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js) de **ce dépôt**, indépendamment du dépôt archivé.
+Le script conserve son nom d'installation et son identifiant afin de mettre à jour la même entrée. Ses adresses `@updateURL` et `@downloadURL` pointent vers [le fichier de la branche `main`](https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js) de **ce dépôt**, indépendamment du dépôt archivé.
 
 Laissez les mises à jour automatiques activées dans Violentmonkey. Le gestionnaire recherche périodiquement une version supérieure : une publication sur GitHub n'est pas nécessairement installée immédiatement. Vous pouvez aussi utiliser le lien d'installation ci-dessus pour mettre à jour manuellement. Rechargez Twitch après une mise à jour.
 
@@ -47,6 +46,6 @@ Pour signaler un problème, indiquez la version du script, le navigateur, les au
 
 ## Origine et licence
 
-Ce projet reprend le travail de [TwitchAdSolutions et de ses contributeurs](https://github.com/pixeltris/TwitchAdSolutions). Les [crédits de VideoAdBlockForTwitch](https://github.com/cleanlock/VideoAdBlockForTwitch#credits) et la [licence MIT d'origine](LICENSE) sont conservés.
+Ce projet reprend le travail de [TwitchAdSolutions et de ses contributeurs](https://github.com/pixeltris/TwitchAdSolutions). Le dépôt d'origine est archivé ; Twitch Ad Block — MATTEO12SA poursuit une évolution indépendante. Les [crédits de VideoAdBlockForTwitch](https://github.com/cleanlock/VideoAdBlockForTwitch#credits) et la [licence MIT d'origine](LICENSE) sont conservés.
 
-Le traitement VOD et les publications de ce dépôt sont propres à **TwitchAD VAFT MATTEO12SA**. Le projet est indépendant de Twitch et de Violentmonkey.
+Le traitement VOD et les publications de ce dépôt sont propres à **Twitch Ad Block — MATTEO12SA**. Le projet est indépendant de Twitch et de Violentmonkey.

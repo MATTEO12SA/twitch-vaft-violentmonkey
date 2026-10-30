@@ -22,7 +22,7 @@ test('release metadata keeps the existing installation and main update URLs', ()
     const metadata = name => source.match(new RegExp('^// @' + name + '\\s+(.+)$', 'm'))?.[1].trim();
     assert.equal(metadata('name'), 'TwitchAD VAFT MATTEO12SA');
     assert.equal(metadata('namespace'), 'https://github.com/MATTEO12SA/twitch-vaft-violentmonkey');
-    assert.equal(metadata('version'), '37.0.4');
+    assert.equal(metadata('version'), '37.0.5');
     assert.equal(metadata('updateURL'), 'https://raw.githubusercontent.com/MATTEO12SA/twitch-vaft-violentmonkey/main/vaft.user.js');
     assert.equal(metadata('downloadURL'), metadata('updateURL'));
     assert.equal(metadata('run-at'), 'document-start');

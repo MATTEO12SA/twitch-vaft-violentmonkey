@@ -23,15 +23,16 @@ Les tests de navigateur injectent le fichier complet dans un contexte isolé, sa
 Avec Node.js 22 ou une version supérieure, depuis la racine du dépôt :
 
 ```sh
-npm run check
-npm test
+npm --prefix .github/checks run check
+npm --prefix .github/checks test
 ```
 
 Ces commandes ne demandent aucune dépendance supplémentaire. GitHub Actions les exécute sur les pushes et les pull requests.
 
-Pour les tests de navigateur, installer Playwright comme outil de développement local :
+Pour les tests de navigateur, depuis la racine du dépôt, entrer dans le dossier technique et installer Playwright comme outil de développement local :
 
 ```sh
+cd .github/checks
 npm install --no-save --package-lock=false playwright
 npm run test:browser
 ```

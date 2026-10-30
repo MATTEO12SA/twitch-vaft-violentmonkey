@@ -2,7 +2,7 @@
   "name": "twitch-vaft-violentmonkey-checks",
   "private": true,
   "scripts": {
-    "check": "node --check vaft.user.js",
+    "check": "node --check ../../vaft.user.js",
     "test": "node --test tests/vod-preroll.test.cjs",
     "test:browser": "node --test tests/native-xhr.cjs"
   },

@@ -2,7 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const source = fs.readFileSync(path.join(__dirname, '..', 'vaft.user.js'), 'utf8').replace(/\r\n/g, '\n');
+const source = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'vaft.user.js'), 'utf8').replace(/\r\n/g, '\n');
 const marker = '// VOD pre-roll:';
 const markerOffset = source.indexOf(marker);
 if (markerOffset === -1) throw new Error('VOD integration marker is missing');
